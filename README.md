@@ -16,6 +16,7 @@ Use this card when you want a compact comparison of a few related sensors on a d
 - Battery / Powerwall state of charge (SOC) side by side  
 - Solar production (house vs shed vs total)  
 - Grid import vs export  
+- AC voltage per phase (with warning thresholds)  
 - Temperatures, loads, or any numeric sensors  
 
 It is **not** a multi-hour history graph. Bars show **current values** (optionally scaled against a 24h history range or fixed limits).
@@ -30,7 +31,8 @@ It is **not** a multi-hour history graph. Bars show **current values** (optional
 | **Layout** | Vertical or horizontal bars |
 | **Scale** | Auto, fixed min/max, or 24h history extremes |
 | **Bounds** | Optional upper/lower reference lines with labels |
-| **Min/Max input** | Static number, `entity_id`, or Jinja template |
+| **Warnings** | Warn-if-above / warn-if-below thresholds; hazard stripes on out-of-spec bar segments; optional warning lines |
+| **Min/Max / warnings input** | Static number, `entity_id`, or Jinja template |
 | **Units** | Per-series factor (e.g. W → kW) and optional custom unit text |
 | **Labels** | Value labels (position + hover/tap/always), series name colours, optional Y-region labels |
 | **Interaction** | Click bar or series name → entity **more-info** dialog |
@@ -108,15 +110,19 @@ Static methods on the card class:
 | `orientation` | `vertical` \| `horizontal` | `vertical` | Bar direction |
 | `value_label_position` | `top` \| `bottom` \| `both` \| `none` | `top` | Where value text sits relative to the bar (`top` = outer end, `bottom` = near baseline) |
 | `value_label_trigger` | `always` \| `hover` \| `tap` | `always` | When value labels are visible |
-| `decimals` | number 0–6 | `1` | Decimal places for value and bound labels (trailing zeros trimmed) |
+| `decimals` | number 0–6 | `1` | Decimal places for value, bound, and warning labels (trailing zeros trimmed) |
 | `scale_mode` | `auto` \| `fixed` \| `history_24h` | `auto` | How min/max of the chart are chosen |
 | `min_value` | number \| entity_id \| Jinja \| null | `null` | Scale minimum and/or lower bound source |
 | `max_value` | number \| entity_id \| Jinja \| null | `null` | Scale maximum and/or upper bound source |
 | `show_zero_line` | boolean | `true` | Dashed zero line when scale crosses 0 |
 | `show_upper_bound` | boolean | `false` | Draw upper reference line |
 | `show_lower_bound` | boolean | `false` | Draw lower reference line |
-| `label_upper_bound` | boolean | `false` | Show numeric label on upper line |
-| `label_lower_bound` | boolean | `false` | Show numeric label on lower line |
+| `label_upper_bound` | boolean | `false` | Show numeric label on upper bound line |
+| `label_lower_bound` | boolean | `false` | Show numeric label on lower bound line |
+| `warn_above` | number \| entity_id \| Jinja \| null | `null` | Warn if value is **above** this threshold |
+| `warn_below` | number \| entity_id \| Jinja \| null | `null` | Warn if value is **below** this threshold |
+| `show_warning_lines` | boolean | `true` | Draw dashed lines at warning thresholds |
+| `label_warning_lines` | boolean | `false` | Show numeric labels on warning lines |
 | `show_y_labels` | boolean | `false` | Region labels (e.g. Export / Import) |
 | `y_label_above` | string | — | Label for positive side of zero |
 | `y_label_below` | string | — | Label for negative side of zero |
@@ -148,19 +154,19 @@ Static methods on the card class:
 ## Scale modes
 
 ### Auto (`auto`)
-Min/max derived from **current** bar values (with light padding). All-positive data typically floors at 0.
+Min/max derived from **current** bar values (with light padding). All-positive data typically floors at 0. Warning thresholds (if set) are included so their lines stay on the plot.
 
 ### Fixed (`fixed`)
 Scale uses resolved **Min** and **Max**. Those values are also used for bound lines when those options are enabled.
 
 ### 24h history (`history_24h`)
-Fetches 24 hours of history via the WebSocket API (`history/history_during_period`), applies each series’ **factor**, and sets scale from the combined history + current values. Useful so a short bar still sits in a meaningful daily context.
+Fetches 24 hours of history via the WebSocket API (`history/history_during_period`), applies each series’ **factor**, and sets scale from the combined history + current values. Warning thresholds are included in the range when set. Useful so a short bar still sits in a meaningful daily context.
 
 ---
 
-## Min / Max: numbers, entities, and templates
+## Min / Max / warnings: numbers, entities, and templates
 
-`min_value` and `max_value` accept:
+`min_value`, `max_value`, `warn_above`, and `warn_below` all accept:
 
 | Kind | Example |
 |------|---------|
@@ -174,7 +180,7 @@ Fetches 24 hours of history via the WebSocket API (`history/history_during_perio
 2. Looks like `domain.object_id` → entity state  
 3. Otherwise → parsed as a number  
 
-**How they interact with scale and bound lines**
+**How Min/Max interact with scale and bound lines**
 
 | Mode | Role of Min/Max |
 |------|------------------|
@@ -188,14 +194,52 @@ Leave Min/Max empty in auto/24h when you only want data-driven scaling with no o
 ## Reference lines
 
 - **Zero line** — only when min &lt; 0 &lt; max and `show_zero_line` is true  
-- **Upper / lower bounds** — dashed lines in the same style; optional value labels (respecting **Decimals** and the first series’ unit when set)
+- **Upper / lower bounds** — dashed lines; optional value labels (respecting **Decimals** and the first series’ unit when set)  
+- **Warning lines** — dashed lines at `warn_above` / `warn_below` when configured and `show_warning_lines` is true (slightly highlighted colour); optional labels via `label_warning_lines`
+
+---
+
+## Warning thresholds
+
+Card-level operational limits (separate from scale bound lines).
+
+| Setting | Meaning |
+|---------|---------|
+| `warn_above` | Values **above** this are out of spec |
+| `warn_below` | Values **below** this are out of spec |
+
+**Bar styling**
+
+- Value inside the safe band → normal solid/gradient fill  
+- Value **above** `warn_above` → solid up to the threshold, **yellow/black hazard stripes** on the excess tip  
+- Value **below** `warn_below` → hazard stripes on the out-of-spec segment, solid for the rest  
+
+Works for **vertical and horizontal** orientation. Only the out-of-spec portion is striped, so you can see how far past the limit the value is.
+
+**Example (AC voltage 170–270, warn outside 208–253)**
+
+```yaml
+scale_mode: fixed
+min_value: 170
+max_value: 270
+warn_below: 208
+warn_above: 253
+show_warning_lines: true
+label_warning_lines: true
+```
+
+| Value | Appearance |
+|-------|------------|
+| 240 | Fully normal colour |
+| 259 | Solid to 253, striped tip 253→259 |
+| 200 | Striped on the portion below 208 |
 
 ---
 
 ## Orientation
 
-- **Vertical** — classic columns; series names under bars; zero/bounds horizontal  
-- **Horizontal** — bars grow left/right; series names on the left; zero/bounds vertical  
+- **Vertical** — classic columns; series names under bars; zero/bounds/warnings horizontal  
+- **Horizontal** — bars grow left/right; series names on the left; zero/bounds/warnings vertical  
 
 Y-region labels (`y_label_above` / `y_label_below`) adapt: rotated on the left in vertical mode; upright above the value axis in horizontal mode.
 
@@ -206,7 +250,7 @@ Y-region labels (`y_label_above` / `y_label_below`) adapt: rotated on the left i
 - **Click** a bar or its series label → `hass-more-info` for that entity  
 - **Keyboard** — focus the bar group (Tab) and press Enter or Space  
 
-Clicks use a full column/row hit target so more-info works reliably on the bar and the label.
+Clicks use a full column/row hit target so more-info works reliably on the bar and the label. The card only fully re-renders when watched entity states change, which avoids flicker and broken clicks on live sensors.
 
 ---
 
@@ -216,22 +260,23 @@ Clicks use a full column/row hit target so more-info works reliably on the bar a
 
 | Step | What happens |
 |------|----------------|
-| `setConfig(config)` | Merges defaults, validates `entities`, sets up min/max resolvers, optional history fetch, renders |
-| `set hass(hass)` | Updates entity data; skips full re-render if watched states are unchanged (reduces flicker); refreshes entity-based bounds |
+| `setConfig(config)` | Merges defaults, validates `entities`, sets up min/max/warn resolvers, optional history fetch, renders |
+| `set hass(hass)` | Updates entity data; skips full re-render if watched states are unchanged (reduces flicker); refreshes entity-based bounds/warnings |
 | `disconnectedCallback` | Unsubscribes Jinja template listeners |
 
 ### Rendering pipeline (simplified)
 
 1. Read up to 4 entities → apply **factor** → build bar values  
-2. Resolve scale via `getMinMaxValues` (auto / fixed / history + bound overrides)  
-3. Build SVG: bars, labels, zero/bound lines, optional gradients  
-4. Apply background, title, icon  
+2. Resolve scale via `getMinMaxValues` (auto / fixed / history + bound & warning range)  
+3. Split each bar into solid + optional warning-stripe segments  
+4. Build SVG: bars, labels, zero/bound/warning lines, patterns, optional gradients  
+5. Apply background, title, icon  
 
 ### Performance notes
 
-- Full SVG rebuild only when a **watched entity state** changes (series entities + entity-type min/max)  
-- Template min/max update via subscription and trigger their own render  
-- Hover styles avoid CSS `filter` on bars (that caused unreliable clicks / flicker in SVG)
+- Full SVG rebuild only when a **watched entity state** changes (series entities + entity-type min/max/warnings)  
+- Template fields update via subscription and trigger their own render  
+- Hover styles avoid CSS `filter` on bars (that caused unreliable clicks / flicker in SVG)  
 
 ---
 
@@ -251,6 +296,7 @@ Opened from the standard Lovelace **Configure card** UI (`getConfigElement()`).
 - **Orientation**, value label position & trigger  
 - **Scale mode**, Min/Max (text — number / entity / template)  
 - Zero line, reference line toggles + labels  
+- **Warning thresholds** (warn if below / above, show lines, label lines)  
 - Y-axis region labels  
 - Height scale & decimals  
 - Background type and related colour / image fields  
@@ -308,6 +354,35 @@ entities:
     color_negative: "#EF4444"
 ```
 
+### AC voltage with warning band
+
+```yaml
+type: custom:one-to-four-bar-chart
+title: AC Voltage
+orientation: horizontal
+scale_mode: fixed
+min_value: 170
+max_value: 270
+warn_below: 208
+warn_above: 253
+show_warning_lines: true
+label_warning_lines: true
+decimals: 0
+entities:
+  - entity: sensor.phase_a_voltage
+    name: Phase A
+    unit: V
+    color: "#3B82F6"
+  - entity: sensor.phase_b_voltage
+    name: Phase B
+    unit: V
+    color: "#3B82F6"
+  - entity: sensor.phase_c_voltage
+    name: Phase C
+    unit: V
+    color: "#3B82F6"
+```
+
 ### Dynamic max from template
 
 ```yaml
@@ -355,7 +430,9 @@ entities:
 | Entity picker missing in editor | HA version / frontend load; fallback text field still works |
 | 24h scale looks wrong | Recorder enabled for those entities; **factor** applied to history and live values |
 | Bound line missing | Enable show upper/lower; ensure resolved min/max is valid; fixed mode needs Min/Max set |
-| Template min/max not updating | Valid Jinja; entity available; check browser console for subscribe errors |
+| Warning stripes not showing | Value must be outside `warn_above` / `warn_below`; thresholds must resolve to numbers |
+| Warning lines missing | Set thresholds; ensure `show_warning_lines` is true; value must fall within current scale (fixed min/max or auto expansion) |
+| Template min/max/warn not updating | Valid Jinja; entity available; check browser console for subscribe errors |
 | more-info unreliable | Use latest file (hit target + render gating); click bar or series label |
 | Flickering bars | Ensure you have the version that only re-renders on relevant state changes |
 
@@ -367,8 +444,9 @@ entities:
 |--------------|------|
 | `OneToFourBarChartCard` | Card element: config, hass, history, scale, SVG render, more-info |
 | `OneToFourBarChartEditor` | Shadow-DOM form editor, config-changed events |
-| Bound resolvers | Number / entity / Jinja for `min_value` & `max_value` |
+| Bound resolvers | Number / entity / Jinja for `min_value`, `max_value`, `warn_above`, `warn_below` |
 | `getMinMaxValues` | Scale + bound line positions |
+| `_barSegments` | Split bar into solid + warning-stripe segments |
 | `formatNumber` | Shared decimal formatting |
 | `_barFill` / `_gradientDef` | Solid vs gradient fills, ± colours |
 
@@ -378,7 +456,7 @@ entities:
 
 - Home Assistant with Lovelace  
 - For **24h history scale**: Recorder (or equivalent history) for the selected entities  
-- For **Jinja min/max**: standard HA template engine (frontend WebSocket)  
+- For **Jinja** min/max/warnings: standard HA template engine (frontend WebSocket)  
 - Modern browser with ES module support  
 
 ---
