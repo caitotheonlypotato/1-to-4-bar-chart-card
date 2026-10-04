@@ -4,7 +4,7 @@ if (!window.customCards.some(card => card.type === "one-to-four-bar-chart")) {
   window.customCards.push({
     type: "one-to-four-bar-chart",
     name: "1 to 4 Bar Chart",
-    description: "A custom multi-entity vertical bar chart card with GUI config flow editor.",
+    description: "A custom multi-entity bar chart card (vertical or horizontal) with GUI config editor.",
     preview: true,
   });
 }
@@ -17,6 +17,22 @@ class OneToFourBarChartCard extends HTMLElement {
     this._hass = null;
     this._historyData = {};
     this._fetchedHistory = false;
+    // Resolved numeric min/max/warnings (from number, entity_id, or Jinja template)
+    this._resolvedMin = null;
+    this._resolvedMax = null;
+    this._resolvedWarnAbove = null;
+    this._resolvedWarnBelow = null;
+    this._boundUnsubs = [];
+    this._boundSourceKey = '';
+    // One-time delegation — survives full SVG re-renders
+    this.shadowRoot.addEventListener('click', (ev) => this._onBarActivate(ev));
+    this.shadowRoot.addEventListener('keydown', (ev) => {
+      if (ev.key === 'Enter' || ev.key === ' ') this._onBarActivate(ev);
+    });
+  }
+
+  disconnectedCallback() {
+    this._clearBoundSubscriptions();
   }
 
   // Mandatory static method for HA Editor link
@@ -28,16 +44,31 @@ class OneToFourBarChartCard extends HTMLElement {
   static getStubConfig() {
     return {
       title: "Bar Chart Comparison",
+      icon: "",
       entities: [
-        { entity: "sensor.temperature", name: "Temp 1", color: "#3B82F6", unit: "", factor: 1 },
-        { entity: "sensor.temperature_2", name: "Temp 2", color: "#10B981", unit: "", factor: 1 }
+        { entity: "sensor.temperature", name: "Temp 1", color: "#3B82F6", color_negative: "", color_mode: "solid", color_end: "", color_end_negative: "", unit: "", factor: 1 },
+        { entity: "sensor.temperature_2", name: "Temp 2", color: "#10B981", color_negative: "", color_mode: "solid", color_end: "", color_end_negative: "", unit: "", factor: 1 }
       ],
+      orientation: "vertical", // vertical | horizontal
       value_label_position: "top", // top, bottom, both, none
       value_label_trigger: "always", // always, hover, tap
+      decimals: 1, // decimal places for value + bound labels
       scale_mode: "auto", // auto, fixed, history_24h
-      min_value: 0,
-      max_value: 100,
+      min_value: null, // fixed scale limit OR optional lower bound override (auto/24h)
+      max_value: null, // fixed scale limit OR optional upper bound override (auto/24h)
       show_zero_line: true,
+      show_upper_bound: false,
+      show_lower_bound: false,
+      label_upper_bound: false,
+      label_lower_bound: false,
+      warn_above: null, // number | entity_id | Jinja — stripe bar above this
+      warn_below: null, // number | entity_id | Jinja — stripe bar below this
+      show_warning_lines: true,
+      label_warning_lines: false,
+      show_y_labels: false,
+      y_label_above: "",
+      y_label_below: "",
+      height_scale: 1,
       background_type: "solid", // solid, gradient, image
       bg_color: "var(--ha-card-background, #1c1c1e)",
       bg_gradient_start: "#1f2937",
@@ -52,12 +83,46 @@ class OneToFourBarChartCard extends HTMLElement {
     const oldHass = this._hass;
     this._hass = hass;
 
-    // Fetch history if needed
+    // Fetch history if needed (will render when data arrives)
     if (this._config.scale_mode === 'history_24h' && (!oldHass || this.shouldFetchHistory(oldHass, hass))) {
       this.fetch24hHistory();
     }
 
+    // Keep entity-based min/max in sync; templates update via subscription
+    this._syncEntityBounds();
+
+    // (Re)subscribe templates when hass first arrives
+    if (!oldHass && hass) {
+      this._setupBoundResolvers();
+    }
+
+    // Skip full DOM rebuild if none of our watched states changed
+    if (!this._entityStatesChanged(oldHass, hass)) {
+      return;
+    }
+
     this.render();
+  }
+
+  _entityStatesChanged(oldHass, newHass) {
+    if (!oldHass || !this._config) return true;
+    const ids = [];
+    for (const item of this._config.entities || []) {
+      if (item.entity) ids.push(item.entity);
+    }
+    // Also watch entity_ids used as min/max/warning bounds
+    for (const key of ['min_value', 'max_value', 'warn_above', 'warn_below']) {
+      const v = this._config[key];
+      if (v != null && this._isEntityId(String(v))) ids.push(String(v).trim());
+    }
+    for (const id of ids) {
+      const a = oldHass.states[id];
+      const b = newHass.states[id];
+      if (!a && !b) continue;
+      if (!a || !b) return true;
+      if (a.state !== b.state) return true;
+    }
+    return false;
   }
 
   setConfig(config) {
@@ -66,13 +131,28 @@ class OneToFourBarChartCard extends HTMLElement {
     }
     this._config = {
       title: "Bar Chart",
+      icon: "",
       entities: [],
+      orientation: "vertical",
       value_label_position: "top",
       value_label_trigger: "always",
+      decimals: 1,
       scale_mode: "auto",
-      min_value: 0,
-      max_value: 100,
+      min_value: null,
+      max_value: null,
       show_zero_line: true,
+      show_upper_bound: false,
+      show_lower_bound: false,
+      label_upper_bound: false,
+      label_lower_bound: false,
+      warn_above: null,
+      warn_below: null,
+      show_warning_lines: true,
+      label_warning_lines: false,
+      show_y_labels: false,
+      y_label_above: "",
+      y_label_below: "",
+      height_scale: 1,
       background_type: "solid",
       bg_color: "var(--ha-card-background, #1c1c1e)",
       bg_gradient_start: "#1f2937",
@@ -82,6 +162,12 @@ class OneToFourBarChartCard extends HTMLElement {
       bg_opacity: 0.2,
       ...config
     };
+    // (Re)fetch 24h history when that scale mode is active
+    if (this._config.scale_mode === 'history_24h' && this._hass) {
+      this._fetchedHistory = false;
+      this.fetch24hHistory();
+    }
+    this._setupBoundResolvers();
     this.render();
   }
 
@@ -122,31 +208,233 @@ class OneToFourBarChartCard extends HTMLElement {
     }
   }
 
+  /** True if config has a non-empty min/max expression (number, entity, or template) */
+  _hasBoundConfig(v) {
+    return v !== null && v !== undefined && String(v).trim() !== '';
+  }
+
+  _isTemplate(v) {
+    const s = String(v);
+    return s.includes('{{') || s.includes('{%');
+  }
+
+  _isEntityId(v) {
+    return /^[a-z0-9_]+\.[a-z0-9_]+$/i.test(String(v).trim());
+  }
+
+  _parseNumericResult(raw) {
+    if (raw === null || raw === undefined) return null;
+    const n = parseFloat(typeof raw === 'object' && raw !== null && 'result' in raw ? raw.result : raw);
+    return Number.isFinite(n) ? n : null;
+  }
+
+  _clearBoundSubscriptions() {
+    (this._boundUnsubs || []).forEach((unsub) => {
+      try {
+        if (typeof unsub === 'function') unsub();
+      } catch (e) { /* ignore */ }
+    });
+    this._boundUnsubs = [];
+    this._boundSourceKey = '';
+  }
+
+  /**
+   * Resolve min/max/warn fields which may be:
+   *  - static number: "100"
+   *  - entity_id: "sensor.foo"
+   *  - Jinja: "{{ states('sensor.foo') | float }}"
+   */
+  _setupBoundResolvers() {
+    const minRaw = this._config?.min_value;
+    const maxRaw = this._config?.max_value;
+    const warnAboveRaw = this._config?.warn_above;
+    const warnBelowRaw = this._config?.warn_below;
+    const sourceKey = `${minRaw ?? ''}|${maxRaw ?? ''}|${warnAboveRaw ?? ''}|${warnBelowRaw ?? ''}`;
+    // Avoid resubscribing if expressions unchanged and already wired
+    if (sourceKey === this._boundSourceKey && this._boundUnsubs.length) {
+      this._syncEntityBounds();
+      return;
+    }
+    this._clearBoundSubscriptions();
+    this._boundSourceKey = sourceKey;
+
+    this._resolvedMin = this._resolveBoundSyncFor(minRaw, null);
+    this._resolvedMax = this._resolveBoundSyncFor(maxRaw, null);
+    this._resolvedWarnAbove = this._resolveBoundSyncFor(warnAboveRaw, null);
+    this._resolvedWarnBelow = this._resolveBoundSyncFor(warnBelowRaw, null);
+
+    if (this._hass) {
+      this._subscribeBoundTemplate('min_value', 'min');
+      this._subscribeBoundTemplate('max_value', 'max');
+      this._subscribeBoundTemplate('warn_above', 'warnAbove');
+      this._subscribeBoundTemplate('warn_below', 'warnBelow');
+    }
+  }
+
+  _resolveBoundSyncFor(raw, previous) {
+    if (!this._hasBoundConfig(raw)) return null;
+    const str = String(raw).trim();
+    if (this._isTemplate(str)) return previous; // templates arrive async via subscription
+    if (this._isEntityId(str)) {
+      if (!this._hass || !this._hass.states[str]) return previous;
+      const n = this._parseNumericResult(this._hass.states[str].state);
+      return n === null ? previous : n;
+    }
+    return this._parseNumericResult(str);
+  }
+
+  _syncEntityBounds() {
+    if (!this._config) return;
+    if (!this._isTemplate(String(this._config.min_value ?? ''))) {
+      this._resolvedMin = this._resolveBoundSyncFor(this._config.min_value, this._resolvedMin);
+    }
+    if (!this._isTemplate(String(this._config.max_value ?? ''))) {
+      this._resolvedMax = this._resolveBoundSyncFor(this._config.max_value, this._resolvedMax);
+    }
+    if (!this._isTemplate(String(this._config.warn_above ?? ''))) {
+      this._resolvedWarnAbove = this._resolveBoundSyncFor(this._config.warn_above, this._resolvedWarnAbove);
+    }
+    if (!this._isTemplate(String(this._config.warn_below ?? ''))) {
+      this._resolvedWarnBelow = this._resolveBoundSyncFor(this._config.warn_below, this._resolvedWarnBelow);
+    }
+  }
+
+  _subscribeBoundTemplate(configKey, which) {
+    const raw = this._config[configKey];
+    if (!this._hasBoundConfig(raw) || !this._isTemplate(String(raw)) || !this._hass?.connection) {
+      return;
+    }
+    const template = String(raw).trim();
+    try {
+      const unsubPromise = this._hass.connection.subscribeMessage(
+        (msg) => {
+          const n = this._parseNumericResult(msg);
+          if (which === 'min') this._resolvedMin = n;
+          else if (which === 'max') this._resolvedMax = n;
+          else if (which === 'warnAbove') this._resolvedWarnAbove = n;
+          else if (which === 'warnBelow') this._resolvedWarnBelow = n;
+          this.render();
+        },
+        { type: 'render_template', template }
+      );
+      Promise.resolve(unsubPromise).then((unsub) => {
+        if (typeof unsub === 'function') this._boundUnsubs.push(unsub);
+      }).catch((err) => {
+        console.warn('1-to-4-bar-chart: template subscribe failed', configKey, err);
+      });
+    } catch (err) {
+      console.warn('1-to-4-bar-chart: template subscribe error', configKey, err);
+    }
+  }
+
+  /**
+   * Split a bar [fromVal → toVal] into solid + optional warning-stripe segments.
+   * Returns array of { from, to, warn } in value-space (caller maps to pixels).
+   */
+  _barSegments(val, baselineVal, warnAbove, warnBelow) {
+    const lo = Math.min(baselineVal, val);
+    const hi = Math.max(baselineVal, val);
+    if (hi === lo) return [{ from: lo, to: hi, warn: false }];
+
+    const hasHi = warnAbove !== null && Number.isFinite(warnAbove);
+    const hasLo = warnBelow !== null && Number.isFinite(warnBelow);
+
+    // Value above upper warning → stripe the excess tip
+    if (hasHi && val > warnAbove) {
+      const split = Math.max(lo, Math.min(hi, warnAbove));
+      const segs = [];
+      if (split > lo) segs.push({ from: lo, to: split, warn: false });
+      if (hi > split) segs.push({ from: split, to: hi, warn: true });
+      return segs.length ? segs : [{ from: lo, to: hi, warn: false }];
+    }
+
+    // Value below lower warning → stripe the excess tip
+    if (hasLo && val < warnBelow) {
+      const split = Math.max(lo, Math.min(hi, warnBelow));
+      const segs = [];
+      if (split > lo) segs.push({ from: lo, to: split, warn: true });
+      if (hi > split) segs.push({ from: split, to: hi, warn: false });
+      return segs.length ? segs : [{ from: lo, to: hi, warn: false }];
+    }
+
+    return [{ from: lo, to: hi, warn: false }];
+  }
+
+  /** Format a number with configured decimals; trim trailing zeros */
+  formatNumber(v) {
+    const decimals = Math.max(0, Math.min(6, Number(this._config.decimals ?? 1)));
+    const n = Number(v);
+    if (isNaN(n)) return String(v);
+    const fixed = n.toFixed(decimals);
+    if (decimals === 0) return fixed;
+    return fixed.replace(/\.?0+$/, '');
+  }
+
+  /** Resolve bar fill (solid or gradient id) for a series */
+  _barFill(d, idx, isHorizontal) {
+    const isNeg = d.val < 0;
+    const c1 = isNeg ? (d.colorNegative || d.color) : d.color;
+    const c2 = isNeg
+      ? (d.colorEndNegative || d.colorEnd || c1)
+      : (d.colorEnd || c1);
+    if (d.colorMode === 'gradient' && c2 && c2 !== c1) {
+      return { fill: `url(#bar-grad-${idx})`, c1, c2, isNeg };
+    }
+    return { fill: c1, c1, c2: c1, isNeg };
+  }
+
+  _gradientDef(idx, c1, c2, isHorizontal, isNeg) {
+    // Gradient runs from baseline → tip of the bar
+    let x1 = 0, y1 = 0, x2 = 0, y2 = 0;
+    if (isHorizontal) {
+      if (isNeg) { x1 = 1; x2 = 0; }
+      else { x1 = 0; x2 = 1; }
+    } else {
+      if (isNeg) { y1 = 0; y2 = 1; }
+      else { y1 = 1; y2 = 0; }
+    }
+    return `<linearGradient id="bar-grad-${idx}" x1="${x1}" y1="${y1}" x2="${x2}" y2="${y2}">
+      <stop offset="0%" stop-color="${c1}"/>
+      <stop offset="100%" stop-color="${c2}"/>
+    </linearGradient>`;
+  }
+
   getMinMaxValues(barValues, entityFactors = {}) {
     let min = 0;
     let max = 100;
+    const mode = this._config.scale_mode || 'auto';
+    // Resolved from number / entity_id / Jinja
+    const resolvedMin = this._resolvedMin;
+    const resolvedMax = this._resolvedMax;
+    const hasMin = resolvedMin !== null && Number.isFinite(resolvedMin);
+    const hasMax = resolvedMax !== null && Number.isFinite(resolvedMax);
 
-    if (this._config.scale_mode === 'fixed') {
-      min = Number(this._config.min_value ?? 0);
-      max = Number(this._config.max_value ?? 100);
-    } else if (this._config.scale_mode === 'history_24h' && Object.keys(this._historyData).length > 0) {
+    if (mode === 'fixed') {
+      min = hasMin ? resolvedMin : 0;
+      max = hasMax ? resolvedMax : 100;
+    } else if (mode === 'history_24h' && Object.keys(this._historyData).length > 0) {
       let allHistVals = [];
       Object.entries(this._historyData).forEach(([entityId, entries]) => {
         const factor = entityFactors[entityId] ?? 1;
-        entries.forEach(entry => {
-          const val = parseFloat(entry.s);
+        const list = Array.isArray(entries) ? entries : [];
+        list.forEach(entry => {
+          if (!entry) return;
+          const raw = entry.s !== undefined ? entry.s : entry.state;
+          const val = parseFloat(raw);
           if (!isNaN(val)) allHistVals.push(val * factor);
         });
       });
       if (allHistVals.length > 0) {
         min = Math.min(...allHistVals, ...barValues);
         max = Math.max(...allHistVals, ...barValues);
-      } else {
+        if (min < 0) min = min * 1.05;
+        if (max > 0) max = max * 1.05;
+      } else if (barValues.length > 0) {
         min = Math.min(...barValues, 0);
         max = Math.max(...barValues, 10);
       }
     } else {
-      // Auto mode based on current values
+      // Auto: current values
       if (barValues.length > 0) {
         const valMin = Math.min(...barValues);
         const valMax = Math.max(...barValues);
@@ -155,11 +443,53 @@ class OneToFourBarChartCard extends HTMLElement {
       }
     }
 
+    // Optional bound / warning overrides expand auto/24h scale so lines always sit on-plot
+    if (mode !== 'fixed') {
+      if (this._config.show_upper_bound && hasMax) {
+        max = Math.max(max, resolvedMax);
+      }
+      if (this._config.show_lower_bound && hasMin) {
+        min = Math.min(min, resolvedMin);
+      }
+      const wa = this._resolvedWarnAbove;
+      const wb = this._resolvedWarnBelow;
+      if (wa !== null && Number.isFinite(wa)) {
+        max = Math.max(max, wa);
+        min = Math.min(min, wa);
+      }
+      if (wb !== null && Number.isFinite(wb)) {
+        max = Math.max(max, wb);
+        min = Math.min(min, wb);
+      }
+    }
+
     if (min === max) {
       max = min + 10;
     }
 
-    return { min, max };
+    // Line positions: explicit override if set, else the scale edge (computed or fixed)
+    let upperBound = null;
+    let lowerBound = null;
+    if (this._config.show_upper_bound) {
+      if (mode === 'fixed') {
+        upperBound = max;
+      } else if (hasMax) {
+        upperBound = resolvedMax;
+      } else {
+        upperBound = max; // peak of auto/history scale
+      }
+    }
+    if (this._config.show_lower_bound) {
+      if (mode === 'fixed') {
+        lowerBound = min;
+      } else if (hasMin) {
+        lowerBound = resolvedMin;
+      } else {
+        lowerBound = min;
+      }
+    }
+
+    return { min, max, upperBound, lowerBound };
   }
 
   render() {
@@ -179,12 +509,22 @@ class OneToFourBarChartCard extends HTMLElement {
       const unit = item.unit || (stateObj && stateObj.attributes.unit_of_measurement) || "";
       const name = item.name || (stateObj && stateObj.attributes.friendly_name) || entityId || `Bar ${idx + 1}`;
       const color = item.color || ["#3B82F6", "#10B981", "#F59E0B", "#EF4444"][idx];
+      const nameColor = item.name_color || "";
+      const colorNegative = item.color_negative || "";
+      const colorMode = item.color_mode === 'gradient' ? 'gradient' : 'solid';
+      const colorEnd = item.color_end || "";
+      const colorEndNegative = item.color_end_negative || "";
 
-      return { val, unit, name, color, entityId, stateObj, factor };
+      return {
+        val, unit, name, color, nameColor, entityId, stateObj, factor,
+        colorNegative, colorMode, colorEnd, colorEndNegative,
+      };
     });
 
     const values = barData.map(d => d.val);
-    const { min, max } = this.getMinMaxValues(values, entityFactors);
+    const { min, max, upperBound, lowerBound } = this.getMinMaxValues(values, entityFactors);
+    // Unit for bound labels: first series custom unit or entity unit
+    const boundUnit = (barData[0] && barData[0].unit) ? ` ${barData[0].unit}` : '';
 
     // Dynamic background styles
     let bgStyle = "";
@@ -196,71 +536,332 @@ class OneToFourBarChartCard extends HTMLElement {
       bgStyle = `background: ${this._config.bg_color};`;
     }
 
-    // Chart Dimensions
+    // Orientation + dimensions
+    const isHorizontal = (this._config.orientation || 'vertical') === 'horizontal';
+    const heightScale = Math.max(0.5, Math.min(3, Number(this._config.height_scale ?? 1) || 1));
     const svgWidth = 400;
-    const svgHeight = 220;
-    const padding = { top: 30, bottom: 40, left: 35, right: 20 };
-    const chartW = svgWidth - padding.left - padding.right;
-    const chartH = svgHeight - padding.top - padding.bottom;
+    // Horizontal mode benefits from a bit more height per bar row
+    const baseH = isHorizontal ? 200 : 220;
+    const svgHeight = Math.round(baseH * heightScale);
+    const showYLabels = !!this._config.show_y_labels &&
+      (!!this._config.y_label_above || !!this._config.y_label_below);
 
-    // Zero Line calculation
-    const zeroY = padding.top + chartH - ((0 - min) / (max - min)) * chartH;
-    const hasZeroLine = this._config.show_zero_line && min < 0 && max > 0;
+    const posSetting = this._config.value_label_position || 'top';
+    // "top" = outer end of bar; "bottom" = near baseline (both orientations)
+    const showOuter = posSetting === 'top' || posSetting === 'both';
+    const showInner = posSetting === 'bottom' || posSetting === 'both';
 
-    // Render SVG Bars
+    const crossesZero = min < 0 && max > 0;
+    const hasZeroLine = this._config.show_zero_line && crossesZero;
+    const range = (max - min) || 1;
+
+    const valFontSize = heightScale < 0.85 ? 9 : 11;
+    const axisFontSize = heightScale < 0.85 ? 9 : 11;
     const numBars = barData.length;
-    const slotW = chartW / Math.max(numBars, 1);
-    const barW = Math.min(slotW * 0.55, 45);
+    const triggerSetting = this._config.value_label_trigger;
+    const triggerClass = triggerSetting === 'hover' ? 'show-hover' : (triggerSetting === 'tap' ? 'show-tap' : 'show-always');
 
-    const barsSVG = barData.map((d, i) => {
-      const centerX = padding.left + slotW * i + slotW / 2;
-      const x = centerX - barW / 2;
+    const formatBound = (v) => `${this.formatNumber(v)}${boundUnit}`;
 
-      // Height logic relative to baseline or zero
-      const baselineVal = (min < 0 && max > 0) ? 0 : (min >= 0 ? min : max);
-      const baseY = padding.top + chartH - ((baselineVal - min) / (max - min)) * chartH;
-      const targetY = padding.top + chartH - ((d.val - min) / (max - min)) * chartH;
+    let padding, chartW, chartH, refLinesSVG = '', regionLabelsSVG = '', barsSVG = '';
+    let gradientDefs = '';
 
-      const y = Math.min(baseY, targetY);
-      const h = Math.max(Math.abs(baseY - targetY), 4); // Min 4px height visibility
+    if (isHorizontal) {
+      // --- HORIZONTAL LAYOUT ---
+      // Category labels on left; bars grow left↔right; value labels at bar ends; zero line vertical
+      const catLabelSpace = 78;
+      const valueLabelSpace = showOuter ? 48 : 16;
+      const regionLabelSpace = showYLabels ? 18 : 8;
+      padding = {
+        top: regionLabelSpace + 8,
+        bottom: 12,
+        left: catLabelSpace,
+        right: valueLabelSpace,
+      };
+      chartW = svgWidth - padding.left - padding.right;
+      chartH = Math.max(24, svgHeight - padding.top - padding.bottom);
 
-      const posSetting = this._config.value_label_position;
-      const triggerSetting = this._config.value_label_trigger;
+      const slotH = chartH / Math.max(numBars, 1);
+      const barH = Math.min(slotH * 0.55, 36);
+      const minBarW = Math.max(2, Math.round(4 * heightScale));
+      const labelGap = Math.max(6, Math.round(8 * heightScale));
 
-      const showTop = posSetting === 'top' || posSetting === 'both';
-      const showBottom = posSetting === 'bottom' || posSetting === 'both';
+      const baselineVal = crossesZero ? 0 : (min >= 0 ? min : max);
+      const baseX = padding.left + ((baselineVal - min) / range) * chartW;
+      const zeroX = padding.left + ((0 - min) / range) * chartW;
 
-      const triggerClass = triggerSetting === 'hover' ? 'show-hover' : (triggerSetting === 'tap' ? 'show-tap' : 'show-always');
+      if (hasZeroLine) {
+        refLinesSVG += `<line x1="${zeroX}" y1="${padding.top}" x2="${zeroX}" y2="${padding.top + chartH}" class="zero-line" />`;
+      }
+      if (upperBound !== null && upperBound >= min && upperBound <= max) {
+        const ux = padding.left + ((upperBound - min) / range) * chartW;
+        refLinesSVG += `<line x1="${ux}" y1="${padding.top}" x2="${ux}" y2="${padding.top + chartH}" class="bound-line" />`;
+        if (this._config.label_upper_bound) {
+          refLinesSVG += `<text x="${ux}" y="${padding.top - 4}" text-anchor="middle" class="bound-label">${formatBound(upperBound)}</text>`;
+        }
+      }
+      if (lowerBound !== null && lowerBound >= min && lowerBound <= max) {
+        const lx = padding.left + ((lowerBound - min) / range) * chartW;
+        refLinesSVG += `<line x1="${lx}" y1="${padding.top}" x2="${lx}" y2="${padding.top + chartH}" class="bound-line" />`;
+        if (this._config.label_lower_bound) {
+          refLinesSVG += `<text x="${lx}" y="${padding.top - 4}" text-anchor="middle" class="bound-label">${formatBound(lowerBound)}</text>`;
+        }
+      }
+      // Warning threshold lines
+      const warnAbove = this._resolvedWarnAbove;
+      const warnBelow = this._resolvedWarnBelow;
+      const showWarnLines = this._config.show_warning_lines !== false;
+      if (showWarnLines && warnAbove !== null && Number.isFinite(warnAbove) && warnAbove >= min && warnAbove <= max) {
+        const wx = padding.left + ((warnAbove - min) / range) * chartW;
+        refLinesSVG += `<line x1="${wx}" y1="${padding.top}" x2="${wx}" y2="${padding.top + chartH}" class="warning-line" />`;
+        if (this._config.label_warning_lines) {
+          refLinesSVG += `<text x="${wx}" y="${padding.top - 4}" text-anchor="middle" class="warning-label">${formatBound(warnAbove)}</text>`;
+        }
+      }
+      if (showWarnLines && warnBelow !== null && Number.isFinite(warnBelow) && warnBelow >= min && warnBelow <= max) {
+        const wx = padding.left + ((warnBelow - min) / range) * chartW;
+        refLinesSVG += `<line x1="${wx}" y1="${padding.top}" x2="${wx}" y2="${padding.top + chartH}" class="warning-line" />`;
+        if (this._config.label_warning_lines) {
+          refLinesSVG += `<text x="${wx}" y="${padding.top - 4}" text-anchor="middle" class="warning-label">${formatBound(warnBelow)}</text>`;
+        }
+      }
 
-      return `
-        <g class="bar-group ${triggerClass}" tabindex="0">
-          <!-- Background interactive slot area -->
-          <rect x="${padding.left + slotW * i}" y="${padding.top}" width="${slotW}" height="${chartH}" fill="transparent" />
+      // Region labels (Export / Import) sit above the value axis, upright
+      if (showYLabels) {
+        const aboveText = this._config.y_label_above || '';
+        const belowText = this._config.y_label_below || '';
+        const labelY = Math.max(axisFontSize + 2, padding.top - 6);
+        if (crossesZero) {
+          if (aboveText) {
+            const midPos = (zeroX + padding.left + chartW) / 2;
+            regionLabelsSVG += `<text x="${midPos}" y="${labelY}" text-anchor="middle" class="y-axis-label">${this._escapeHtml(aboveText)}</text>`;
+          }
+          if (belowText) {
+            const midNeg = (padding.left + zeroX) / 2;
+            regionLabelsSVG += `<text x="${midNeg}" y="${labelY}" text-anchor="middle" class="y-axis-label">${this._escapeHtml(belowText)}</text>`;
+          }
+        } else if (min >= 0 && aboveText) {
+          regionLabelsSVG += `<text x="${padding.left + chartW / 2}" y="${labelY}" text-anchor="middle" class="y-axis-label">${this._escapeHtml(aboveText)}</text>`;
+        } else if (max <= 0 && belowText) {
+          regionLabelsSVG += `<text x="${padding.left + chartW / 2}" y="${labelY}" text-anchor="middle" class="y-axis-label">${this._escapeHtml(belowText)}</text>`;
+        } else if (aboveText) {
+          regionLabelsSVG += `<text x="${padding.left + chartW / 2}" y="${labelY}" text-anchor="middle" class="y-axis-label">${this._escapeHtml(aboveText)}</text>`;
+        }
+      }
 
-          <!-- Bar Rect -->
-          <rect x="${x}" y="${y}" width="${barW}" height="${h}" rx="4" ry="4" fill="${d.color}" class="bar-rect" />
+      barsSVG = barData.map((d, i) => {
+        const centerY = padding.top + slotH * i + slotH / 2;
+        const y = centerY - barH / 2;
+        const targetX = padding.left + ((d.val - min) / range) * chartW;
+        const x = Math.min(baseX, targetX);
+        const w = Math.max(Math.abs(baseX - targetX), minBarW);
 
-          <!-- Top Label -->
-          ${showTop ? `
-            <text x="${centerX}" y="${y - 8}" text-anchor="middle" class="val-label top-label">
-              ${d.val}${d.unit ? ' ' + d.unit : ''}
+        // Outer = far end of bar; inner = near baseline
+        const growsRight = targetX >= baseX;
+        let outerX = growsRight ? x + w + labelGap : x - labelGap;
+        let outerAnchor = growsRight ? 'start' : 'end';
+        let innerX = growsRight ? x - labelGap : x + w + labelGap;
+        let innerAnchor = growsRight ? 'end' : 'start';
+
+        // Clamp into viewBox
+        const minLX = 4;
+        const maxLX = svgWidth - 4;
+        outerX = Math.max(minLX, Math.min(maxLX, outerX));
+        innerX = Math.max(minLX, Math.min(maxLX, innerX));
+
+        const valText = `${this.formatNumber(d.val)}${d.unit ? ' ' + d.unit : ''}`;
+        const fillInfo = this._barFill(d, i, true);
+        if (fillInfo.fill.startsWith('url(')) {
+          gradientDefs += this._gradientDef(i, fillInfo.c1, fillInfo.c2, true, fillInfo.isNeg);
+        }
+
+        const segs = this._barSegments(d.val, baselineVal, this._resolvedWarnAbove, this._resolvedWarnBelow);
+        const segRects = segs.map((seg, si) => {
+          const x1 = padding.left + ((seg.from - min) / range) * chartW;
+          const x2 = padding.left + ((seg.to - min) / range) * chartW;
+          const sx = Math.min(x1, x2);
+          const sw = Math.max(Math.abs(x2 - x1), si === 0 ? minBarW : 1);
+          const fill = seg.warn ? 'url(#warn-stripes)' : fillInfo.fill;
+          const radius = segs.length === 1 ? 'rx="4" ry="4"' : (si === 0 && !growsRight) || (si === segs.length - 1 && growsRight) ? 'rx="4" ry="4"' : '';
+          return `<rect x="${sx}" y="${y}" width="${sw}" height="${barH}" ${radius} fill="${fill}" class="bar-rect" />`;
+        }).join('');
+
+        return `
+          <g class="bar-group ${triggerClass}" tabindex="0" role="button" data-entity="${this._escapeHtml(d.entityId || '')}">
+            ${segRects}
+            ${showOuter ? `
+              <text x="${outerX}" y="${centerY}" dominant-baseline="middle" text-anchor="${outerAnchor}" class="val-label" font-size="${valFontSize}">${valText}</text>
+            ` : ''}
+            ${showInner ? `
+              <text x="${innerX}" y="${centerY}" dominant-baseline="middle" text-anchor="${innerAnchor}" class="val-label" font-size="${valFontSize}">${valText}</text>
+            ` : ''}
+            <text x="${padding.left - 8}" y="${centerY}" dominant-baseline="middle" text-anchor="end" class="axis-label" font-size="${axisFontSize}"${d.nameColor ? ` style="fill:${this._escapeHtml(d.nameColor)}"` : ''}>${this._escapeHtml(d.name)}</text>
+            <!-- Full-width hit target including left labels -->
+            <rect class="bar-hit" x="0" y="${padding.top + slotH * i}" width="${svgWidth}" height="${slotH}" />
+          </g>
+        `;
+      }).join('');
+    } else {
+      // --- VERTICAL LAYOUT (existing behaviour) ---
+      const labelGapTop = Math.max(6, Math.round(10 * heightScale));
+      const labelGapBottom = Math.max(8, Math.round(14 * heightScale));
+      const axisLabelSpace = Math.max(14, Math.round(18 * Math.min(heightScale, 1)));
+      const padTop = Math.max(
+        showOuter ? labelGapTop + 12 : 12,
+        Math.round(28 * heightScale)
+      );
+      const padBottom = Math.max(
+        axisLabelSpace + (showInner ? labelGapBottom : 0),
+        Math.round(36 * heightScale)
+      );
+      const boundLabelRight = (this._config.label_upper_bound || this._config.label_lower_bound) ? 36 : 0;
+      padding = {
+        top: padTop,
+        bottom: padBottom,
+        left: showYLabels ? 52 : 35,
+        right: 20 + boundLabelRight,
+      };
+      chartW = svgWidth - padding.left - padding.right;
+      chartH = Math.max(20, svgHeight - padding.top - padding.bottom);
+
+      const zeroY = padding.top + chartH - ((0 - min) / range) * chartH;
+      if (hasZeroLine) {
+        refLinesSVG += `<line x1="${padding.left}" y1="${zeroY}" x2="${svgWidth - padding.right}" y2="${zeroY}" class="zero-line" />`;
+      }
+      if (upperBound !== null && upperBound >= min && upperBound <= max) {
+        const uy = padding.top + chartH - ((upperBound - min) / range) * chartH;
+        refLinesSVG += `<line x1="${padding.left}" y1="${uy}" x2="${svgWidth - padding.right}" y2="${uy}" class="bound-line" />`;
+        if (this._config.label_upper_bound) {
+          refLinesSVG += `<text x="${svgWidth - padding.right + 4}" y="${uy}" dominant-baseline="middle" text-anchor="start" class="bound-label">${formatBound(upperBound)}</text>`;
+        }
+      }
+      if (lowerBound !== null && lowerBound >= min && lowerBound <= max) {
+        const ly = padding.top + chartH - ((lowerBound - min) / range) * chartH;
+        refLinesSVG += `<line x1="${padding.left}" y1="${ly}" x2="${svgWidth - padding.right}" y2="${ly}" class="bound-line" />`;
+        if (this._config.label_lower_bound) {
+          refLinesSVG += `<text x="${svgWidth - padding.right + 4}" y="${ly}" dominant-baseline="middle" text-anchor="start" class="bound-label">${formatBound(lowerBound)}</text>`;
+        }
+      }
+      // Warning threshold lines
+      const warnAboveV = this._resolvedWarnAbove;
+      const warnBelowV = this._resolvedWarnBelow;
+      const showWarnLinesV = this._config.show_warning_lines !== false;
+      if (showWarnLinesV && warnAboveV !== null && Number.isFinite(warnAboveV) && warnAboveV >= min && warnAboveV <= max) {
+        const wy = padding.top + chartH - ((warnAboveV - min) / range) * chartH;
+        refLinesSVG += `<line x1="${padding.left}" y1="${wy}" x2="${svgWidth - padding.right}" y2="${wy}" class="warning-line" />`;
+        if (this._config.label_warning_lines) {
+          refLinesSVG += `<text x="${svgWidth - padding.right + 4}" y="${wy}" dominant-baseline="middle" text-anchor="start" class="warning-label">${formatBound(warnAboveV)}</text>`;
+        }
+      }
+      if (showWarnLinesV && warnBelowV !== null && Number.isFinite(warnBelowV) && warnBelowV >= min && warnBelowV <= max) {
+        const wy = padding.top + chartH - ((warnBelowV - min) / range) * chartH;
+        refLinesSVG += `<line x1="${padding.left}" y1="${wy}" x2="${svgWidth - padding.right}" y2="${wy}" class="warning-line" />`;
+        if (this._config.label_warning_lines) {
+          refLinesSVG += `<text x="${svgWidth - padding.right + 4}" y="${wy}" dominant-baseline="middle" text-anchor="start" class="warning-label">${formatBound(warnBelowV)}</text>`;
+        }
+      }
+
+      const slotW = chartW / Math.max(numBars, 1);
+      const barW = Math.min(slotW * 0.55, 45);
+      const minBarH = Math.max(2, Math.round(4 * heightScale));
+      const topLabelMinY = valFontSize + 2;
+      const bottomLabelMaxY = svgHeight - axisLabelSpace - 2;
+
+      const baselineVal = crossesZero ? 0 : (min >= 0 ? min : max);
+      const baseY = padding.top + chartH - ((baselineVal - min) / range) * chartH;
+
+      barsSVG = barData.map((d, i) => {
+        const centerX = padding.left + slotW * i + slotW / 2;
+        const x = centerX - barW / 2;
+        const targetY = padding.top + chartH - ((d.val - min) / range) * chartH;
+        const y = Math.min(baseY, targetY);
+        const h = Math.max(Math.abs(baseY - targetY), minBarH);
+
+        let outerLabelY = y - labelGapTop;
+        if (outerLabelY < topLabelMinY) outerLabelY = topLabelMinY;
+
+        let innerLabelY = y + h + labelGapBottom;
+        if (innerLabelY > bottomLabelMaxY) innerLabelY = bottomLabelMaxY;
+        if (showInner && innerLabelY < y + h + 4) {
+          innerLabelY = Math.min(y + h + Math.max(4, labelGapBottom * 0.6), bottomLabelMaxY);
+        }
+
+        const valText = `${this.formatNumber(d.val)}${d.unit ? ' ' + d.unit : ''}`;
+        const fillInfo = this._barFill(d, i, false);
+        if (fillInfo.fill.startsWith('url(')) {
+          gradientDefs += this._gradientDef(i, fillInfo.c1, fillInfo.c2, false, fillInfo.isNeg);
+        }
+
+        const growsUp = targetY <= baseY;
+        const segs = this._barSegments(d.val, baselineVal, this._resolvedWarnAbove, this._resolvedWarnBelow);
+        const segRects = segs.map((seg, si) => {
+          const y1 = padding.top + chartH - ((seg.from - min) / range) * chartH;
+          const y2 = padding.top + chartH - ((seg.to - min) / range) * chartH;
+          const sy = Math.min(y1, y2);
+          const sh = Math.max(Math.abs(y2 - y1), si === 0 ? minBarH : 1);
+          const fill = seg.warn ? 'url(#warn-stripes)' : fillInfo.fill;
+          // Round the outer tip corners only
+          const isTip = (growsUp && seg.to === Math.max(seg.from, seg.to) && d.val >= baselineVal && si === segs.length - 1)
+            || (growsUp && d.val < baselineVal && si === 0)
+            || (!growsUp && si === segs.length - 1);
+          const radius = segs.length === 1 ? 'rx="4" ry="4"' : (isTip ? 'rx="4" ry="4"' : '');
+          return `<rect x="${x}" y="${sy}" width="${barW}" height="${sh}" ${radius} fill="${fill}" class="bar-rect" />`;
+        }).join('');
+
+        return `
+          <g class="bar-group ${triggerClass}" tabindex="0" role="button" data-entity="${this._escapeHtml(d.entityId || '')}">
+            ${segRects}
+            ${showOuter ? `
+              <text x="${centerX}" y="${outerLabelY}" text-anchor="middle" class="val-label" font-size="${valFontSize}">${valText}</text>
+            ` : ''}
+            ${showInner ? `
+              <text x="${centerX}" y="${innerLabelY}" text-anchor="middle" class="val-label" font-size="${valFontSize}">${valText}</text>
+            ` : ''}
+            <text x="${centerX}" y="${svgHeight - Math.max(4, Math.round(6 * heightScale))}" text-anchor="middle" class="axis-label" font-size="${axisFontSize}"${d.nameColor ? ` style="fill:${this._escapeHtml(d.nameColor)}"` : ''}>
+              ${this._escapeHtml(d.name)}
             </text>
-          ` : ''}
+            <!-- Full-column hit target including bottom labels -->
+            <rect class="bar-hit" x="${padding.left + slotW * i}" y="0" width="${slotW}" height="${svgHeight}" />
+          </g>
+        `;
+      }).join('');
 
-          <!-- Bottom Label -->
-          ${showBottom ? `
-            <text x="${centerX}" y="${y + h + 16}" text-anchor="middle" class="val-label bottom-label">
-              ${d.val}${d.unit ? ' ' + d.unit : ''}
-            </text>
-          ` : ''}
-
-          <!-- X-Axis Label -->
-          <text x="${centerX}" y="${svgHeight - 12}" text-anchor="middle" class="axis-label">
-            ${d.name}
-          </text>
-        </g>
-      `;
-    }).join('');
+      // Left-side region labels (rotated)
+      if (showYLabels) {
+        const labelX = 14;
+        const aboveText = this._config.y_label_above || '';
+        const belowText = this._config.y_label_below || '';
+        if (crossesZero) {
+          if (aboveText) {
+            const midAbove = (padding.top + zeroY) / 2;
+            regionLabelsSVG += `
+              <text x="${labelX}" y="${midAbove}" text-anchor="middle" class="y-axis-label"
+                transform="rotate(-90, ${labelX}, ${midAbove})">${this._escapeHtml(aboveText)}</text>`;
+          }
+          if (belowText) {
+            const midBelow = (zeroY + padding.top + chartH) / 2;
+            regionLabelsSVG += `
+              <text x="${labelX}" y="${midBelow}" text-anchor="middle" class="y-axis-label"
+                transform="rotate(-90, ${labelX}, ${midBelow})">${this._escapeHtml(belowText)}</text>`;
+          }
+        } else if (min >= 0 && aboveText) {
+          const mid = padding.top + chartH / 2;
+          regionLabelsSVG += `
+            <text x="${labelX}" y="${mid}" text-anchor="middle" class="y-axis-label"
+              transform="rotate(-90, ${labelX}, ${mid})">${this._escapeHtml(aboveText)}</text>`;
+        } else if (max <= 0 && belowText) {
+          const mid = padding.top + chartH / 2;
+          regionLabelsSVG += `
+            <text x="${labelX}" y="${mid}" text-anchor="middle" class="y-axis-label"
+              transform="rotate(-90, ${labelX}, ${mid})">${this._escapeHtml(belowText)}</text>`;
+        } else if (aboveText) {
+          const mid = padding.top + chartH / 2;
+          regionLabelsSVG += `
+            <text x="${labelX}" y="${mid}" text-anchor="middle" class="y-axis-label"
+              transform="rotate(-90, ${labelX}, ${mid})">${this._escapeHtml(aboveText)}</text>`;
+        }
+      }
+    }
 
     this.shadowRoot.innerHTML = `
       <style>
@@ -286,42 +887,77 @@ class OneToFourBarChartCard extends HTMLElement {
           position: relative;
           z-index: 2;
         }
+        .card-header {
+          display: flex;
+          flex-direction: column;
+          align-items: flex-start;
+          gap: 6px;
+          margin-bottom: 12px;
+        }
         .card-title {
           font-size: 1.1rem;
           font-weight: 600;
-          margin-bottom: 12px;
           color: var(--primary-text-color, #ffffff);
-          display: flex;
-          align-items: center;
-          justify-content: space-between;
+          line-height: 1.3;
+        }
+        .card-icon {
+          --mdc-icon-size: 28px;
+          color: var(--primary-text-color, #ffffff);
+          opacity: 0.9;
         }
         svg {
           width: 100%;
           height: auto;
           overflow: visible;
         }
-        .zero-line {
+        .zero-line, .bound-line, .warning-line {
           stroke: rgba(255, 255, 255, 0.35);
           stroke-dasharray: 4,4;
           stroke-width: 1.5;
         }
+        .warning-line {
+          stroke: rgba(234, 179, 8, 0.65);
+        }
+        .bound-label, .warning-label {
+          fill: var(--secondary-text-color, #9ca3af);
+          font-size: ${axisFontSize}px;
+          font-weight: 600;
+        }
+        .warning-label {
+          fill: #EAB308;
+        }
         .axis-label {
           fill: var(--secondary-text-color, #9ca3af);
-          font-size: 11px;
+          font-size: ${axisFontSize}px;
           font-weight: 500;
+        }
+        .y-axis-label {
+          fill: var(--secondary-text-color, #9ca3af);
+          font-size: ${axisFontSize}px;
+          font-weight: 600;
+          letter-spacing: 0.5px;
         }
         .val-label {
           fill: var(--primary-text-color, #ffffff);
-          font-size: 11px;
+          font-size: ${valFontSize}px;
           font-weight: 700;
           transition: opacity 0.2s ease-in-out;
         }
         .bar-rect {
-          transition: height 0.4s ease, y 0.4s ease, filter 0.2s ease;
+          pointer-events: none;
+          transition: height 0.4s ease, width 0.4s ease, y 0.4s ease, x 0.4s ease;
         }
-        .bar-group:hover .bar-rect, .bar-group:focus .bar-rect {
-          filter: brightness(1.2);
+        .val-label, .axis-label {
+          pointer-events: none;
+        }
+        /* Transparent hit layer on top of bar + labels — receives all clicks */
+        .bar-hit {
+          fill: transparent;
           cursor: pointer;
+          pointer-events: all;
+        }
+        .bar-group:hover .bar-hit, .bar-group:focus .bar-hit {
+          fill: rgba(255, 255, 255, 0.06);
         }
 
         /* Label Triggers */
@@ -337,14 +973,62 @@ class OneToFourBarChartCard extends HTMLElement {
       <ha-card>
         ${this._config.background_type === 'image' ? '<div class="bg-overlay"></div>' : ''}
         <div class="content">
-          ${this._config.title ? `<div class="card-title">${this._config.title}</div>` : ''}
+          ${(this._config.title || this._config.icon) ? `
+            <div class="card-header">
+              ${this._config.title ? `<div class="card-title">${this._escapeHtml(this._config.title)}</div>` : ''}
+              ${this._config.icon ? `<ha-icon class="card-icon" icon="${this._escapeHtml(this._config.icon)}"></ha-icon>` : ''}
+            </div>
+          ` : ''}
           <svg viewBox="0 0 ${svgWidth} ${svgHeight}">
-            ${hasZeroLine ? `<line x1="${padding.left}" y1="${zeroY}" x2="${svgWidth - padding.right}" y2="${zeroY}" class="zero-line" />` : ''}
+            <defs>
+              <pattern id="warn-stripes" patternUnits="userSpaceOnUse" width="10" height="10" patternTransform="rotate(45)">
+                <rect width="10" height="10" fill="#EAB308"/>
+                <rect width="5" height="10" fill="#1a1a1a"/>
+              </pattern>
+              ${gradientDefs}
+            </defs>
+            ${refLinesSVG}
+            ${regionLabelsSVG}
             ${barsSVG}
           </svg>
         </div>
       </ha-card>
     `;
+  }
+
+  _onBarActivate(ev) {
+    // Walk up from target (works for SVG nodes) to find data-entity
+    let el = ev.target;
+    while (el && el !== this.shadowRoot) {
+      if (el.getAttribute) {
+        const entityId = el.getAttribute('data-entity');
+        if (entityId) {
+          ev.preventDefault();
+          ev.stopPropagation();
+          this._openMoreInfo(entityId);
+          return;
+        }
+      }
+      el = el.parentElement || el.parentNode;
+    }
+  }
+
+  _openMoreInfo(entityId) {
+    if (!entityId) return;
+    const event = new CustomEvent('hass-more-info', {
+      detail: { entityId },
+      bubbles: true,
+      composed: true,
+    });
+    this.dispatchEvent(event);
+  }
+
+  _escapeHtml(str) {
+    return String(str)
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;');
   }
 }
 
@@ -394,6 +1078,8 @@ class OneToFourBarChartEditor extends HTMLElement {
     return [
       config.scale_mode || 'auto',
       config.background_type || 'solid',
+      config.orientation || 'vertical',
+      !!config.show_y_labels,
       (config.entities || []).length,
     ].join('|');
   }
@@ -409,18 +1095,25 @@ class OneToFourBarChartEditor extends HTMLElement {
 
   async _ensureHelpers() {
     if (this._helpersLoaded) return;
-    // Force-load HA editor components so ha-entity-picker becomes available
+    // Force-load HA editor components (entity + icon pickers)
     try {
-      if (!customElements.get('ha-entity-picker')) {
+      if (!customElements.get('ha-entity-picker') || !customElements.get('ha-icon-picker')) {
         const entitiesCard = customElements.get('hui-entities-card');
         if (entitiesCard && entitiesCard.getConfigElement) {
           await entitiesCard.getConfigElement();
         }
+        // Button / entity card editors also pull in ha-icon-picker
+        const buttonCard = customElements.get('hui-button-card');
+        if (buttonCard && buttonCard.getConfigElement) {
+          await buttonCard.getConfigElement();
+        }
       }
-      // Extra safety: wait a tick for the element to register
-      await customElements.whenDefined('ha-entity-picker').catch(() => {});
+      await Promise.all([
+        customElements.whenDefined('ha-entity-picker').catch(() => {}),
+        customElements.whenDefined('ha-icon-picker').catch(() => {}),
+      ]);
     } catch (e) {
-      console.warn('Could not pre-load ha-entity-picker', e);
+      console.warn('Could not pre-load HA pickers', e);
     }
     this._helpersLoaded = true;
   }
@@ -431,9 +1124,9 @@ class OneToFourBarChartEditor extends HTMLElement {
     const field = target.dataset.field;
     const index = target.dataset.index;
 
-    // For ha-entity-picker the value lives on .value
+    // HA pickers expose .value; native inputs use target.value / checked
     let value;
-    if (target.tagName === 'HA-ENTITY-PICKER') {
+    if (target.tagName === 'HA-ENTITY-PICKER' || target.tagName === 'HA-ICON-PICKER') {
       value = target.value;
     } else if (target.type === 'checkbox') {
       value = target.checked;
@@ -441,6 +1134,11 @@ class OneToFourBarChartEditor extends HTMLElement {
       value = target.value === '' ? null : Number(target.value);
     } else {
       value = target.value;
+    }
+
+    // Min/Max/warn: empty → null; keep strings for entity_id / Jinja
+    if (['min_value', 'max_value', 'warn_above', 'warn_below'].includes(field) && (value === '' || value === null || value === undefined)) {
+      value = null;
     }
 
     const updatedConfig = JSON.parse(JSON.stringify(this._config));
@@ -465,6 +1163,11 @@ class OneToFourBarChartEditor extends HTMLElement {
         entity: '',
         name: `Bar ${updatedConfig.entities.length + 1}`,
         color: ['#3B82F6', '#10B981', '#F59E0B', '#EF4444'][updatedConfig.entities.length],
+        color_negative: '',
+        color_mode: 'solid',
+        color_end: '',
+        color_end_negative: '',
+        name_color: '',
         unit: '',
         factor: 1,
       });
@@ -490,10 +1193,17 @@ class OneToFourBarChartEditor extends HTMLElement {
       titleInput.value = cfg.title || '';
     }
 
-    // Root selects / checkboxes / numbers
+    // Icon picker
+    const iconPicker = this.shadowRoot.querySelector('ha-icon-picker[data-field="icon"]');
+    if (iconPicker && iconPicker.value !== (cfg.icon || '')) {
+      iconPicker.value = cfg.icon || '';
+    }
+
+    // Root selects / checkboxes / numbers (and text fallback for icon)
     this.shadowRoot.querySelectorAll('[data-field]:not([data-index])').forEach((el) => {
       const field = el.dataset.field;
       if (field === 'title') return;
+      if (field === 'icon' && el.tagName === 'HA-ICON-PICKER') return;
       const val = cfg[field];
       if (el.type === 'checkbox') {
         el.checked = !!val;
@@ -510,10 +1220,15 @@ class OneToFourBarChartEditor extends HTMLElement {
       if (entityPicker && entityPicker.value !== (item.entity || '')) {
         entityPicker.value = item.entity || '';
       }
-      ['name', 'color', 'unit', 'factor'].forEach((f) => {
+      ['name', 'color', 'color_negative', 'color_mode', 'color_end', 'color_end_negative', 'name_color', 'unit', 'factor'].forEach((f) => {
         const input = this.shadowRoot.querySelector(`[data-field="${f}"][data-index="${idx}"]`);
         if (input) {
-          const expected = f === 'factor' ? (item[f] ?? 1) : (item[f] ?? '');
+          let expected;
+          if (f === 'factor') expected = item[f] ?? 1;
+          else if (f === 'name_color') expected = item[f] || '#9ca3af';
+          else if (f === 'color_mode') expected = item[f] || 'solid';
+          else if (f === 'color_negative' || f === 'color_end' || f === 'color_end_negative') expected = item[f] || '#888888';
+          else expected = item[f] ?? '';
           if (String(input.value) !== String(expected)) {
             input.value = expected;
           }
@@ -535,6 +1250,7 @@ class OneToFourBarChartEditor extends HTMLElement {
 
     const entities = this._config.entities || [];
     const hasEntityPicker = !!customElements.get('ha-entity-picker');
+    const hasIconPicker = !!customElements.get('ha-icon-picker');
 
     this.shadowRoot.innerHTML = `
       <style>
@@ -604,7 +1320,8 @@ class OneToFourBarChartEditor extends HTMLElement {
           flex-direction: column;
           gap: 8px;
         }
-        ha-entity-picker {
+        ha-entity-picker,
+        ha-icon-picker {
           display: block;
           width: 100%;
         }
@@ -615,6 +1332,15 @@ class OneToFourBarChartEditor extends HTMLElement {
         <div class="field">
           <label>Card Title</label>
           <input type="text" data-field="title" value="${this._escape(this._config.title || '')}" />
+        </div>
+
+        <!-- Icon -->
+        <div class="field">
+          <label>Card Icon</label>
+          ${hasIconPicker
+            ? `<ha-icon-picker data-field="icon" label="" placeholder="mdi:chart-bar"></ha-icon-picker>`
+            : `<input type="text" data-field="icon" value="${this._escape(this._config.icon || '')}" placeholder="mdi:chart-bar" />`
+          }
         </div>
 
         <!-- Entities Section -->
@@ -644,18 +1370,41 @@ class OneToFourBarChartEditor extends HTMLElement {
                 <input type="text" data-field="name" data-index="${idx}" value="${this._escape(item.name || '')}" />
               </div>
               <div class="field">
-                <label>Color</label>
-                <input type="color" data-field="color" data-index="${idx}" value="${item.color || '#3B82F6'}" />
+                <label>Label color</label>
+                <input type="color" data-field="name_color" data-index="${idx}" value="${item.name_color || '#9ca3af'}" title="Series name colour" />
               </div>
               <div class="field">
                 <label>Custom Unit</label>
                 <input type="text" data-field="unit" data-index="${idx}" value="${this._escape(item.unit || '')}" placeholder="Auto" />
               </div>
+              <div class="field">
+                <label>Factor</label>
+                <input type="number" step="any" data-field="factor" data-index="${idx}" value="${item.factor ?? 1}" title="e.g. 0.001 for W→kW" />
+              </div>
             </div>
             <div class="row">
               <div class="field">
-                <label>Factor (multiplier)</label>
-                <input type="number" step="any" data-field="factor" data-index="${idx}" value="${item.factor ?? 1}" title="e.g. 0.001 for W→kW, 1000 for kW→W" />
+                <label>Fill mode</label>
+                <select data-field="color_mode" data-index="${idx}">
+                  <option value="solid" ${(item.color_mode || 'solid') === 'solid' ? 'selected' : ''}>Solid</option>
+                  <option value="gradient" ${item.color_mode === 'gradient' ? 'selected' : ''}>Gradient</option>
+                </select>
+              </div>
+              <div class="field">
+                <label>Bar +</label>
+                <input type="color" data-field="color" data-index="${idx}" value="${item.color || '#3B82F6'}" title="Positive value colour" />
+              </div>
+              <div class="field">
+                <label>Bar −</label>
+                <input type="color" data-field="color_negative" data-index="${idx}" value="${item.color_negative || '#EF4444'}" title="Negative value colour (optional)" />
+              </div>
+              <div class="field">
+                <label>Grad end +</label>
+                <input type="color" data-field="color_end" data-index="${idx}" value="${item.color_end || item.color || '#93C5FD'}" title="Gradient end (positive)" />
+              </div>
+              <div class="field">
+                <label>Grad end −</label>
+                <input type="color" data-field="color_end_negative" data-index="${idx}" value="${item.color_end_negative || item.color_negative || '#FCA5A5'}" title="Gradient end (negative)" />
               </div>
             </div>
           </div>
@@ -667,14 +1416,23 @@ class OneToFourBarChartEditor extends HTMLElement {
         <div class="section-title">Label & Scale Options</div>
         <div class="row">
           <div class="field">
+            <label>Orientation</label>
+            <select data-field="orientation">
+              <option value="vertical" ${(this._config.orientation || 'vertical') === 'vertical' ? 'selected' : ''}>Vertical bars</option>
+              <option value="horizontal" ${this._config.orientation === 'horizontal' ? 'selected' : ''}>Horizontal bars</option>
+            </select>
+          </div>
+          <div class="field">
             <label>Value Label Position</label>
             <select data-field="value_label_position">
-              <option value="top" ${this._config.value_label_position === 'top' ? 'selected' : ''}>Top</option>
-              <option value="bottom" ${this._config.value_label_position === 'bottom' ? 'selected' : ''}>Bottom</option>
+              <option value="top" ${this._config.value_label_position === 'top' ? 'selected' : ''}>Outer end (top / far)</option>
+              <option value="bottom" ${this._config.value_label_position === 'bottom' ? 'selected' : ''}>Near baseline</option>
               <option value="both" ${this._config.value_label_position === 'both' ? 'selected' : ''}>Both</option>
               <option value="none" ${this._config.value_label_position === 'none' ? 'selected' : ''}>None</option>
             </select>
           </div>
+        </div>
+        <div class="row">
           <div class="field">
             <label>Trigger</label>
             <select data-field="value_label_trigger">
@@ -694,16 +1452,17 @@ class OneToFourBarChartEditor extends HTMLElement {
               <option value="history_24h" ${this._config.scale_mode === 'history_24h' ? 'selected' : ''}>24h History Scale</option>
             </select>
           </div>
-          ${this._config.scale_mode === 'fixed' ? `
-            <div class="field">
-              <label>Min</label>
-              <input type="number" data-field="min_value" value="${this._config.min_value ?? 0}" />
-            </div>
-            <div class="field">
-              <label>Max</label>
-              <input type="number" data-field="max_value" value="${this._config.max_value ?? 100}" />
-            </div>
-          ` : ''}
+          <div class="field">
+            <label>${this._config.scale_mode === 'fixed' ? 'Min (scale)' : 'Min (optional bound)'}</label>
+            <input type="text" data-field="min_value" value="${this._escape(this._config.min_value ?? '')}" placeholder="0 | sensor.x | {{ ... }}" />
+          </div>
+          <div class="field">
+            <label>${this._config.scale_mode === 'fixed' ? 'Max (scale)' : 'Max (optional bound)'}</label>
+            <input type="text" data-field="max_value" value="${this._escape(this._config.max_value ?? '')}" placeholder="100 | sensor.x | {{ ... }}" />
+          </div>
+        </div>
+        <div style="font-size:11px;color:var(--secondary-text-color,#9ca3af);margin-top:-6px;">
+          Min/Max accept a number, an entity_id, or a Jinja template (e.g. &#123;&#123; states('sensor.cap') | float &#125;&#125;).
         </div>
 
         <div class="row">
@@ -711,6 +1470,86 @@ class OneToFourBarChartEditor extends HTMLElement {
             <input type="checkbox" data-field="show_zero_line" ${this._config.show_zero_line ? 'checked' : ''} />
             Show Zero Line (if min &lt; 0 &lt; max)
           </label>
+        </div>
+
+        <div class="section-title">Reference lines</div>
+        <div class="row">
+          <label class="row" style="cursor: pointer;">
+            <input type="checkbox" data-field="show_upper_bound" ${this._config.show_upper_bound ? 'checked' : ''} />
+            Show upper bound line
+          </label>
+          <label class="row" style="cursor: pointer;">
+            <input type="checkbox" data-field="label_upper_bound" ${this._config.label_upper_bound ? 'checked' : ''} />
+            Label upper value
+          </label>
+        </div>
+        <div class="row">
+          <label class="row" style="cursor: pointer;">
+            <input type="checkbox" data-field="show_lower_bound" ${this._config.show_lower_bound ? 'checked' : ''} />
+            Show lower bound line
+          </label>
+          <label class="row" style="cursor: pointer;">
+            <input type="checkbox" data-field="label_lower_bound" ${this._config.label_lower_bound ? 'checked' : ''} />
+            Label lower value
+          </label>
+        </div>
+        <div style="font-size:11px;color:var(--secondary-text-color,#9ca3af);margin-top:-6px;">
+          Fixed: lines use Min/Max. Auto/24h: use Max/Min if set, otherwise the computed scale edge (e.g. 24h peak).
+        </div>
+
+        <div class="section-title">Warning thresholds</div>
+        <div class="row">
+          <div class="field">
+            <label>Warn if below</label>
+            <input type="text" data-field="warn_below" value="${this._escape(this._config.warn_below ?? '')}" placeholder="e.g. 208" />
+          </div>
+          <div class="field">
+            <label>Warn if above</label>
+            <input type="text" data-field="warn_above" value="${this._escape(this._config.warn_above ?? '')}" placeholder="e.g. 253" />
+          </div>
+        </div>
+        <div class="row">
+          <label class="row" style="cursor: pointer;">
+            <input type="checkbox" data-field="show_warning_lines" ${this._config.show_warning_lines !== false ? 'checked' : ''} />
+            Show warning lines
+          </label>
+          <label class="row" style="cursor: pointer;">
+            <input type="checkbox" data-field="label_warning_lines" ${this._config.label_warning_lines ? 'checked' : ''} />
+            Label warning values
+          </label>
+        </div>
+        <div style="font-size:11px;color:var(--secondary-text-color,#9ca3af);margin-top:-6px;">
+          Number, entity_id, or Jinja. Out-of-spec portion of each bar uses hazard stripes.
+        </div>
+
+        <div class="row">
+          <label class="row" style="cursor: pointer;">
+            <input type="checkbox" data-field="show_y_labels" ${this._config.show_y_labels ? 'checked' : ''} />
+            Show Y-axis labels (left side)
+          </label>
+        </div>
+        ${this._config.show_y_labels ? `
+          <div class="row">
+            <div class="field">
+              <label>Label above zero</label>
+              <input type="text" data-field="y_label_above" value="${this._escape(this._config.y_label_above || '')}" placeholder="e.g. Export" />
+            </div>
+            <div class="field">
+              <label>Label below zero</label>
+              <input type="text" data-field="y_label_below" value="${this._escape(this._config.y_label_below || '')}" placeholder="e.g. Import" />
+            </div>
+          </div>
+        ` : ''}
+
+        <div class="row">
+          <div class="field">
+            <label>Height scale (1 = default)</label>
+            <input type="number" step="0.1" min="0.5" max="3" data-field="height_scale" value="${this._config.height_scale ?? 1}" title="1 = normal, 1.5 = 50% taller, 0.75 = more compact" />
+          </div>
+          <div class="field">
+            <label>Decimals</label>
+            <input type="number" step="1" min="0" max="6" data-field="decimals" value="${this._config.decimals ?? 1}" title="Decimal places for value and bound labels" />
+          </div>
         </div>
 
         <!-- Background Options -->
@@ -792,6 +1631,22 @@ class OneToFourBarChartEditor extends HTMLElement {
           target: {
             tagName: 'HA-ENTITY-PICKER',
             dataset: { field: 'entity', index: idx },
+            value: e.detail?.value ?? picker.value,
+          },
+        };
+        this._handleFieldChange(fakeEv);
+      });
+    });
+
+    // Icon picker
+    this.shadowRoot.querySelectorAll('ha-icon-picker').forEach((picker) => {
+      if (this._hass) picker.hass = this._hass;
+      picker.value = this._config.icon || '';
+      picker.addEventListener('value-changed', (e) => {
+        const fakeEv = {
+          target: {
+            tagName: 'HA-ICON-PICKER',
+            dataset: { field: 'icon' },
             value: e.detail?.value ?? picker.value,
           },
         };
