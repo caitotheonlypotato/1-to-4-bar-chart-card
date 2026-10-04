@@ -61,13 +61,18 @@ class OneToFourBarChartCard extends HTMLElement {
       show_lower_bound: false,
       label_upper_bound: false,
       label_lower_bound: false,
+      upper_bound_color: "#ffffff",
+      lower_bound_color: "#ffffff",
       warn_above: null, // number | entity_id | Jinja — stripe bar above this
       warn_below: null, // number | entity_id | Jinja — stripe bar below this
       show_warning_lines: true,
       label_warning_lines: false,
+      warn_above_color: "#EAB308",
+      warn_below_color: "#EAB308",
       show_y_labels: false,
       y_label_above: "",
       y_label_below: "",
+      y_label_color: "#9ca3af",
       height_scale: 1,
       background_type: "solid", // solid, gradient, image
       bg_color: "var(--ha-card-background, #1c1c1e)",
@@ -145,13 +150,18 @@ class OneToFourBarChartCard extends HTMLElement {
       show_lower_bound: false,
       label_upper_bound: false,
       label_lower_bound: false,
+      upper_bound_color: "#ffffff",
+      lower_bound_color: "#ffffff",
       warn_above: null,
       warn_below: null,
       show_warning_lines: true,
       label_warning_lines: false,
+      warn_above_color: "#EAB308",
+      warn_below_color: "#EAB308",
       show_y_labels: false,
       y_label_above: "",
       y_label_below: "",
+      y_label_color: "#9ca3af",
       height_scale: 1,
       background_type: "solid",
       bg_color: "var(--ha-card-background, #1c1c1e)",
@@ -526,6 +536,13 @@ class OneToFourBarChartCard extends HTMLElement {
     // Unit for bound labels: first series custom unit or entity unit
     const boundUnit = (barData[0] && barData[0].unit) ? ` ${barData[0].unit}` : '';
 
+    // Configurable colours for bounds / warnings / Y labels
+    const upperBoundColor = this._config.upper_bound_color || '#ffffff';
+    const lowerBoundColor = this._config.lower_bound_color || '#ffffff';
+    const warnAboveColor = this._config.warn_above_color || '#EAB308';
+    const warnBelowColor = this._config.warn_below_color || '#EAB308';
+    const yLabelColor = this._config.y_label_color || '#9ca3af';
+
     // Dynamic background styles
     let bgStyle = "";
     if (this._config.background_type === "gradient") {
@@ -595,16 +612,16 @@ class OneToFourBarChartCard extends HTMLElement {
       }
       if (upperBound !== null && upperBound >= min && upperBound <= max) {
         const ux = padding.left + ((upperBound - min) / range) * chartW;
-        refLinesSVG += `<line x1="${ux}" y1="${padding.top}" x2="${ux}" y2="${padding.top + chartH}" class="bound-line" />`;
+        refLinesSVG += `<line x1="${ux}" y1="${padding.top}" x2="${ux}" y2="${padding.top + chartH}" class="bound-line" style="stroke:${this._escapeHtml(upperBoundColor)}" />`;
         if (this._config.label_upper_bound) {
-          refLinesSVG += `<text x="${ux}" y="${padding.top - 4}" text-anchor="middle" class="bound-label">${formatBound(upperBound)}</text>`;
+          refLinesSVG += `<text x="${ux}" y="${padding.top - 4}" text-anchor="middle" class="bound-label" style="fill:${this._escapeHtml(upperBoundColor)}">${formatBound(upperBound)}</text>`;
         }
       }
       if (lowerBound !== null && lowerBound >= min && lowerBound <= max) {
         const lx = padding.left + ((lowerBound - min) / range) * chartW;
-        refLinesSVG += `<line x1="${lx}" y1="${padding.top}" x2="${lx}" y2="${padding.top + chartH}" class="bound-line" />`;
+        refLinesSVG += `<line x1="${lx}" y1="${padding.top}" x2="${lx}" y2="${padding.top + chartH}" class="bound-line" style="stroke:${this._escapeHtml(lowerBoundColor)}" />`;
         if (this._config.label_lower_bound) {
-          refLinesSVG += `<text x="${lx}" y="${padding.top - 4}" text-anchor="middle" class="bound-label">${formatBound(lowerBound)}</text>`;
+          refLinesSVG += `<text x="${lx}" y="${padding.top - 4}" text-anchor="middle" class="bound-label" style="fill:${this._escapeHtml(lowerBoundColor)}">${formatBound(lowerBound)}</text>`;
         }
       }
       // Warning threshold lines
@@ -613,16 +630,16 @@ class OneToFourBarChartCard extends HTMLElement {
       const showWarnLines = this._config.show_warning_lines !== false;
       if (showWarnLines && warnAbove !== null && Number.isFinite(warnAbove) && warnAbove >= min && warnAbove <= max) {
         const wx = padding.left + ((warnAbove - min) / range) * chartW;
-        refLinesSVG += `<line x1="${wx}" y1="${padding.top}" x2="${wx}" y2="${padding.top + chartH}" class="warning-line" />`;
+        refLinesSVG += `<line x1="${wx}" y1="${padding.top}" x2="${wx}" y2="${padding.top + chartH}" class="warning-line" style="stroke:${this._escapeHtml(warnAboveColor)}" />`;
         if (this._config.label_warning_lines) {
-          refLinesSVG += `<text x="${wx}" y="${padding.top - 4}" text-anchor="middle" class="warning-label">${formatBound(warnAbove)}</text>`;
+          refLinesSVG += `<text x="${wx}" y="${padding.top - 4}" text-anchor="middle" class="warning-label" style="fill:${this._escapeHtml(warnAboveColor)}">${formatBound(warnAbove)}</text>`;
         }
       }
       if (showWarnLines && warnBelow !== null && Number.isFinite(warnBelow) && warnBelow >= min && warnBelow <= max) {
         const wx = padding.left + ((warnBelow - min) / range) * chartW;
-        refLinesSVG += `<line x1="${wx}" y1="${padding.top}" x2="${wx}" y2="${padding.top + chartH}" class="warning-line" />`;
+        refLinesSVG += `<line x1="${wx}" y1="${padding.top}" x2="${wx}" y2="${padding.top + chartH}" class="warning-line" style="stroke:${this._escapeHtml(warnBelowColor)}" />`;
         if (this._config.label_warning_lines) {
-          refLinesSVG += `<text x="${wx}" y="${padding.top - 4}" text-anchor="middle" class="warning-label">${formatBound(warnBelow)}</text>`;
+          refLinesSVG += `<text x="${wx}" y="${padding.top - 4}" text-anchor="middle" class="warning-label" style="fill:${this._escapeHtml(warnBelowColor)}">${formatBound(warnBelow)}</text>`;
         }
       }
 
@@ -631,21 +648,22 @@ class OneToFourBarChartCard extends HTMLElement {
         const aboveText = this._config.y_label_above || '';
         const belowText = this._config.y_label_below || '';
         const labelY = Math.max(axisFontSize + 2, padding.top - 6);
+        const yStyle = `style="fill:${this._escapeHtml(yLabelColor)}"`;
         if (crossesZero) {
           if (aboveText) {
             const midPos = (zeroX + padding.left + chartW) / 2;
-            regionLabelsSVG += `<text x="${midPos}" y="${labelY}" text-anchor="middle" class="y-axis-label">${this._escapeHtml(aboveText)}</text>`;
+            regionLabelsSVG += `<text x="${midPos}" y="${labelY}" text-anchor="middle" class="y-axis-label" ${yStyle}>${this._escapeHtml(aboveText)}</text>`;
           }
           if (belowText) {
             const midNeg = (padding.left + zeroX) / 2;
-            regionLabelsSVG += `<text x="${midNeg}" y="${labelY}" text-anchor="middle" class="y-axis-label">${this._escapeHtml(belowText)}</text>`;
+            regionLabelsSVG += `<text x="${midNeg}" y="${labelY}" text-anchor="middle" class="y-axis-label" ${yStyle}>${this._escapeHtml(belowText)}</text>`;
           }
         } else if (min >= 0 && aboveText) {
-          regionLabelsSVG += `<text x="${padding.left + chartW / 2}" y="${labelY}" text-anchor="middle" class="y-axis-label">${this._escapeHtml(aboveText)}</text>`;
+          regionLabelsSVG += `<text x="${padding.left + chartW / 2}" y="${labelY}" text-anchor="middle" class="y-axis-label" ${yStyle}>${this._escapeHtml(aboveText)}</text>`;
         } else if (max <= 0 && belowText) {
-          regionLabelsSVG += `<text x="${padding.left + chartW / 2}" y="${labelY}" text-anchor="middle" class="y-axis-label">${this._escapeHtml(belowText)}</text>`;
+          regionLabelsSVG += `<text x="${padding.left + chartW / 2}" y="${labelY}" text-anchor="middle" class="y-axis-label" ${yStyle}>${this._escapeHtml(belowText)}</text>`;
         } else if (aboveText) {
-          regionLabelsSVG += `<text x="${padding.left + chartW / 2}" y="${labelY}" text-anchor="middle" class="y-axis-label">${this._escapeHtml(aboveText)}</text>`;
+          regionLabelsSVG += `<text x="${padding.left + chartW / 2}" y="${labelY}" text-anchor="middle" class="y-axis-label" ${yStyle}>${this._escapeHtml(aboveText)}</text>`;
         }
       }
 
@@ -730,16 +748,16 @@ class OneToFourBarChartCard extends HTMLElement {
       }
       if (upperBound !== null && upperBound >= min && upperBound <= max) {
         const uy = padding.top + chartH - ((upperBound - min) / range) * chartH;
-        refLinesSVG += `<line x1="${padding.left}" y1="${uy}" x2="${svgWidth - padding.right}" y2="${uy}" class="bound-line" />`;
+        refLinesSVG += `<line x1="${padding.left}" y1="${uy}" x2="${svgWidth - padding.right}" y2="${uy}" class="bound-line" style="stroke:${this._escapeHtml(upperBoundColor)}" />`;
         if (this._config.label_upper_bound) {
-          refLinesSVG += `<text x="${svgWidth - padding.right + 4}" y="${uy}" dominant-baseline="middle" text-anchor="start" class="bound-label">${formatBound(upperBound)}</text>`;
+          refLinesSVG += `<text x="${svgWidth - padding.right + 4}" y="${uy}" dominant-baseline="middle" text-anchor="start" class="bound-label" style="fill:${this._escapeHtml(upperBoundColor)}">${formatBound(upperBound)}</text>`;
         }
       }
       if (lowerBound !== null && lowerBound >= min && lowerBound <= max) {
         const ly = padding.top + chartH - ((lowerBound - min) / range) * chartH;
-        refLinesSVG += `<line x1="${padding.left}" y1="${ly}" x2="${svgWidth - padding.right}" y2="${ly}" class="bound-line" />`;
+        refLinesSVG += `<line x1="${padding.left}" y1="${ly}" x2="${svgWidth - padding.right}" y2="${ly}" class="bound-line" style="stroke:${this._escapeHtml(lowerBoundColor)}" />`;
         if (this._config.label_lower_bound) {
-          refLinesSVG += `<text x="${svgWidth - padding.right + 4}" y="${ly}" dominant-baseline="middle" text-anchor="start" class="bound-label">${formatBound(lowerBound)}</text>`;
+          refLinesSVG += `<text x="${svgWidth - padding.right + 4}" y="${ly}" dominant-baseline="middle" text-anchor="start" class="bound-label" style="fill:${this._escapeHtml(lowerBoundColor)}">${formatBound(lowerBound)}</text>`;
         }
       }
       // Warning threshold lines
@@ -748,16 +766,16 @@ class OneToFourBarChartCard extends HTMLElement {
       const showWarnLinesV = this._config.show_warning_lines !== false;
       if (showWarnLinesV && warnAboveV !== null && Number.isFinite(warnAboveV) && warnAboveV >= min && warnAboveV <= max) {
         const wy = padding.top + chartH - ((warnAboveV - min) / range) * chartH;
-        refLinesSVG += `<line x1="${padding.left}" y1="${wy}" x2="${svgWidth - padding.right}" y2="${wy}" class="warning-line" />`;
+        refLinesSVG += `<line x1="${padding.left}" y1="${wy}" x2="${svgWidth - padding.right}" y2="${wy}" class="warning-line" style="stroke:${this._escapeHtml(warnAboveColor)}" />`;
         if (this._config.label_warning_lines) {
-          refLinesSVG += `<text x="${svgWidth - padding.right + 4}" y="${wy}" dominant-baseline="middle" text-anchor="start" class="warning-label">${formatBound(warnAboveV)}</text>`;
+          refLinesSVG += `<text x="${svgWidth - padding.right + 4}" y="${wy}" dominant-baseline="middle" text-anchor="start" class="warning-label" style="fill:${this._escapeHtml(warnAboveColor)}">${formatBound(warnAboveV)}</text>`;
         }
       }
       if (showWarnLinesV && warnBelowV !== null && Number.isFinite(warnBelowV) && warnBelowV >= min && warnBelowV <= max) {
         const wy = padding.top + chartH - ((warnBelowV - min) / range) * chartH;
-        refLinesSVG += `<line x1="${padding.left}" y1="${wy}" x2="${svgWidth - padding.right}" y2="${wy}" class="warning-line" />`;
+        refLinesSVG += `<line x1="${padding.left}" y1="${wy}" x2="${svgWidth - padding.right}" y2="${wy}" class="warning-line" style="stroke:${this._escapeHtml(warnBelowColor)}" />`;
         if (this._config.label_warning_lines) {
-          refLinesSVG += `<text x="${svgWidth - padding.right + 4}" y="${wy}" dominant-baseline="middle" text-anchor="start" class="warning-label">${formatBound(warnBelowV)}</text>`;
+          refLinesSVG += `<text x="${svgWidth - padding.right + 4}" y="${wy}" dominant-baseline="middle" text-anchor="start" class="warning-label" style="fill:${this._escapeHtml(warnBelowColor)}">${formatBound(warnBelowV)}</text>`;
         }
       }
 
@@ -831,33 +849,34 @@ class OneToFourBarChartCard extends HTMLElement {
         const labelX = 14;
         const aboveText = this._config.y_label_above || '';
         const belowText = this._config.y_label_below || '';
+        const yStyle = `style="fill:${this._escapeHtml(yLabelColor)}"`;
         if (crossesZero) {
           if (aboveText) {
             const midAbove = (padding.top + zeroY) / 2;
             regionLabelsSVG += `
-              <text x="${labelX}" y="${midAbove}" text-anchor="middle" class="y-axis-label"
+              <text x="${labelX}" y="${midAbove}" text-anchor="middle" class="y-axis-label" ${yStyle}
                 transform="rotate(-90, ${labelX}, ${midAbove})">${this._escapeHtml(aboveText)}</text>`;
           }
           if (belowText) {
             const midBelow = (zeroY + padding.top + chartH) / 2;
             regionLabelsSVG += `
-              <text x="${labelX}" y="${midBelow}" text-anchor="middle" class="y-axis-label"
+              <text x="${labelX}" y="${midBelow}" text-anchor="middle" class="y-axis-label" ${yStyle}
                 transform="rotate(-90, ${labelX}, ${midBelow})">${this._escapeHtml(belowText)}</text>`;
           }
         } else if (min >= 0 && aboveText) {
           const mid = padding.top + chartH / 2;
           regionLabelsSVG += `
-            <text x="${labelX}" y="${mid}" text-anchor="middle" class="y-axis-label"
+            <text x="${labelX}" y="${mid}" text-anchor="middle" class="y-axis-label" ${yStyle}
               transform="rotate(-90, ${labelX}, ${mid})">${this._escapeHtml(aboveText)}</text>`;
         } else if (max <= 0 && belowText) {
           const mid = padding.top + chartH / 2;
           regionLabelsSVG += `
-            <text x="${labelX}" y="${mid}" text-anchor="middle" class="y-axis-label"
+            <text x="${labelX}" y="${mid}" text-anchor="middle" class="y-axis-label" ${yStyle}
               transform="rotate(-90, ${labelX}, ${mid})">${this._escapeHtml(belowText)}</text>`;
         } else if (aboveText) {
           const mid = padding.top + chartH / 2;
           regionLabelsSVG += `
-            <text x="${labelX}" y="${mid}" text-anchor="middle" class="y-axis-label"
+            <text x="${labelX}" y="${mid}" text-anchor="middle" class="y-axis-label" ${yStyle}
               transform="rotate(-90, ${labelX}, ${mid})">${this._escapeHtml(aboveText)}</text>`;
         }
       }
@@ -915,16 +934,10 @@ class OneToFourBarChartCard extends HTMLElement {
           stroke-dasharray: 4,4;
           stroke-width: 1.5;
         }
-        .warning-line {
-          stroke: rgba(234, 179, 8, 0.65);
-        }
         .bound-label, .warning-label {
           fill: var(--secondary-text-color, #9ca3af);
           font-size: ${axisFontSize}px;
           font-weight: 600;
-        }
-        .warning-label {
-          fill: #EAB308;
         }
         .axis-label {
           fill: var(--secondary-text-color, #9ca3af);
@@ -1482,6 +1495,10 @@ class OneToFourBarChartEditor extends HTMLElement {
             <input type="checkbox" data-field="label_upper_bound" ${this._config.label_upper_bound ? 'checked' : ''} />
             Label upper value
           </label>
+          <div class="field" style="flex: 0 0 70px;">
+            <label>Colour</label>
+            <input type="color" data-field="upper_bound_color" value="${this._config.upper_bound_color || '#ffffff'}" title="Upper bound line & label colour" />
+          </div>
         </div>
         <div class="row">
           <label class="row" style="cursor: pointer;">
@@ -1492,6 +1509,10 @@ class OneToFourBarChartEditor extends HTMLElement {
             <input type="checkbox" data-field="label_lower_bound" ${this._config.label_lower_bound ? 'checked' : ''} />
             Label lower value
           </label>
+          <div class="field" style="flex: 0 0 70px;">
+            <label>Colour</label>
+            <input type="color" data-field="lower_bound_color" value="${this._config.lower_bound_color || '#ffffff'}" title="Lower bound line & label colour" />
+          </div>
         </div>
         <div style="font-size:11px;color:var(--secondary-text-color,#9ca3af);margin-top:-6px;">
           Fixed: lines use Min/Max. Auto/24h: use Max/Min if set, otherwise the computed scale edge (e.g. 24h peak).
@@ -1518,6 +1539,16 @@ class OneToFourBarChartEditor extends HTMLElement {
             Label warning values
           </label>
         </div>
+        <div class="row">
+          <div class="field" style="flex: 0 0 90px;">
+            <label>Above colour</label>
+            <input type="color" data-field="warn_above_color" value="${this._config.warn_above_color || '#EAB308'}" title="Upper warning line & label colour" />
+          </div>
+          <div class="field" style="flex: 0 0 90px;">
+            <label>Below colour</label>
+            <input type="color" data-field="warn_below_color" value="${this._config.warn_below_color || '#EAB308'}" title="Lower warning line & label colour" />
+          </div>
+        </div>
         <div style="font-size:11px;color:var(--secondary-text-color,#9ca3af);margin-top:-6px;">
           Number, entity_id, or Jinja. Out-of-spec portion of each bar uses hazard stripes.
         </div>
@@ -1527,6 +1558,10 @@ class OneToFourBarChartEditor extends HTMLElement {
             <input type="checkbox" data-field="show_y_labels" ${this._config.show_y_labels ? 'checked' : ''} />
             Show Y-axis labels (left side)
           </label>
+          <div class="field" style="flex: 0 0 70px;">
+            <label>Colour</label>
+            <input type="color" data-field="y_label_color" value="${this._config.y_label_color || '#9ca3af'}" title="Y-axis label colour" />
+          </div>
         </div>
         ${this._config.show_y_labels ? `
           <div class="row">
