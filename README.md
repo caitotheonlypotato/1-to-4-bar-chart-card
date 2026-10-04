@@ -5,9 +5,7 @@ A custom **Home Assistant Lovelace card** that displays **1–4 entities** as a 
 **Card type:** `custom:one-to-four-bar-chart`  
 **Resource file:** `1_to_4_bar_chart.js`
 
-![Card screenshot 1](screenshot.jpg)
-
-![Card screenshot 2](screenshot2.jpg)
+![Card screenshot](screenshot.jpg)
 
 ---
 
@@ -32,14 +30,14 @@ It is **not** a multi-hour history graph. Bars show **current values** (optional
 | **Series** | 1–4 entities, custom labels, units, colour, ± colours, gradients |
 | **Layout** | Vertical or horizontal bars |
 | **Scale** | Auto, fixed min/max, or 24h history extremes |
-| **Bounds** | Optional upper/lower reference lines with labels |
-| **Warnings** | Warn-if-above / warn-if-below thresholds; hazard stripes on out-of-spec bar segments; optional warning lines |
+| **Bounds** | Optional upper/lower reference lines with labels and **custom colours** |
+| **Warnings** | Warn-if-above / warn-if-below thresholds; hazard stripes on out-of-spec bar segments; optional warning lines with **custom colours** |
 | **Min/Max / warnings input** | Static number, `entity_id`, or Jinja template |
 | **Units** | Per-series factor (e.g. W → kW) and optional custom unit text |
-| **Labels** | Value labels (position + hover/tap/always), series name colours, optional Y-region labels |
+| **Labels** | Value labels (position + hover/tap/always), series name colours, optional Y-region labels with **custom colour** |
 | **Interaction** | Click bar or series name → entity **more-info** dialog |
 | **Appearance** | Title, icon, height scale, decimals, solid/gradient/image background |
-| **Editor** | Full UI editor (entity picker, icon picker, colour pickers, etc.) |
+| **Editor** | Full UI editor (entity picker, icon picker, colour pickers for bounds / warnings / Y labels, etc.) |
 
 ---
 
@@ -121,13 +119,18 @@ Static methods on the card class:
 | `show_lower_bound` | boolean | `false` | Draw lower reference line |
 | `label_upper_bound` | boolean | `false` | Show numeric label on upper bound line |
 | `label_lower_bound` | boolean | `false` | Show numeric label on lower bound line |
+| `upper_bound_color` | string (hex) | `#ffffff` | Colour of the upper bound line **and** its label |
+| `lower_bound_color` | string (hex) | `#ffffff` | Colour of the lower bound line **and** its label |
 | `warn_above` | number \| entity_id \| Jinja \| null | `null` | Warn if value is **above** this threshold |
 | `warn_below` | number \| entity_id \| Jinja \| null | `null` | Warn if value is **below** this threshold |
 | `show_warning_lines` | boolean | `true` | Draw dashed lines at warning thresholds |
 | `label_warning_lines` | boolean | `false` | Show numeric labels on warning lines |
+| `warn_above_color` | string (hex) | `#EAB308` | Colour of the upper warning line **and** its label |
+| `warn_below_color` | string (hex) | `#EAB308` | Colour of the lower warning line **and** its label |
 | `show_y_labels` | boolean | `false` | Region labels (e.g. Export / Import) |
 | `y_label_above` | string | — | Label for positive side of zero |
 | `y_label_below` | string | — | Label for negative side of zero |
+| `y_label_color` | string (hex) | `#9ca3af` | Colour of the Y-axis region labels |
 | `height_scale` | number | `1` | Multiplier for chart height (~0.5–3) |
 | `background_type` | `solid` \| `gradient` \| `image` | `solid` | Card background style |
 | `bg_color` | string | theme / dark grey | Solid background (hex or CSS variable) |
@@ -196,8 +199,8 @@ Leave Min/Max empty in auto/24h when you only want data-driven scaling with no o
 ## Reference lines
 
 - **Zero line** — only when min &lt; 0 &lt; max and `show_zero_line` is true  
-- **Upper / lower bounds** — dashed lines; optional value labels (respecting **Decimals** and the first series’ unit when set)  
-- **Warning lines** — dashed lines at `warn_above` / `warn_below` when configured and `show_warning_lines` is true (slightly highlighted colour); optional labels via `label_warning_lines`
+- **Upper / lower bounds** — dashed lines; optional value labels (respecting **Decimals** and the first series’ unit when set). Colour controlled by `upper_bound_color` / `lower_bound_color` (applies to both the line and its label).  
+- **Warning lines** — dashed lines at `warn_above` / `warn_below` when configured and `show_warning_lines` is true. Colour controlled independently by `warn_above_color` / `warn_below_color` (applies to both the line and its label).  
 
 ---
 
@@ -228,6 +231,8 @@ warn_below: 208
 warn_above: 253
 show_warning_lines: true
 label_warning_lines: true
+warn_above_color: "#EAB308"
+warn_below_color: "#EF4444"
 ```
 
 | Value | Appearance |
@@ -243,7 +248,7 @@ label_warning_lines: true
 - **Vertical** — classic columns; series names under bars; zero/bounds/warnings horizontal  
 - **Horizontal** — bars grow left/right; series names on the left; zero/bounds/warnings vertical  
 
-Y-region labels (`y_label_above` / `y_label_below`) adapt: rotated on the left in vertical mode; upright above the value axis in horizontal mode.
+Y-region labels (`y_label_above` / `y_label_below`) adapt: rotated on the left in vertical mode; upright above the value axis in horizontal mode. Colour is controlled by `y_label_color`.
 
 ---
 
@@ -271,7 +276,7 @@ Clicks use a full column/row hit target so more-info works reliably on the bar a
 1. Read up to 4 entities → apply **factor** → build bar values  
 2. Resolve scale via `getMinMaxValues` (auto / fixed / history + bound & warning range)  
 3. Split each bar into solid + optional warning-stripe segments  
-4. Build SVG: bars, labels, zero/bound/warning lines, patterns, optional gradients  
+4. Build SVG: bars, labels, zero/bound/warning lines (with configured colours), patterns, optional gradients  
 5. Apply background, title, icon  
 
 ### Performance notes
@@ -297,9 +302,9 @@ Opened from the standard Lovelace **Configure card** UI (`getConfigElement()`).
   - Add / remove series  
 - **Orientation**, value label position & trigger  
 - **Scale mode**, Min/Max (text — number / entity / template)  
-- Zero line, reference line toggles + labels  
-- **Warning thresholds** (warn if below / above, show lines, label lines)  
-- Y-axis region labels  
+- Zero line, reference line toggles + labels + **colour pickers** for upper/lower bounds  
+- **Warning thresholds** (warn if below / above, show lines, label lines) + **separate colour pickers** for above/below warning lines  
+- Y-axis region labels + **colour picker**  
 - Height scale & decimals  
 - Background type and related colour / image fields  
 
@@ -308,6 +313,7 @@ Opened from the standard Lovelace **Configure card** UI (`getConfigElement()`).
 - Uses **`change`** events (not `input`) so typing in text fields does not steal focus  
 - Structural changes (scale mode, background type, entity count, etc.) re-render the form; value-only changes **sync in place** where possible  
 - Loads `ha-entity-picker` / `ha-icon-picker` by invoking known HA card config elements when needed  
+- Colour pickers for bounds, warnings, and Y labels sit next to their related checkboxes so the form stays organised  
 
 ---
 
@@ -324,6 +330,7 @@ scale_mode: auto
 max_value: 100
 show_upper_bound: true
 label_upper_bound: true
+upper_bound_color: "#94a3b8"
 decimals: 1
 entities:
   - entity: sensor.pw_batt_1_soc
@@ -347,6 +354,7 @@ show_zero_line: true
 show_y_labels: true
 y_label_above: Export
 y_label_below: Import
+y_label_color: "#e2e8f0"
 entities:
   - entity: sensor.grid_power_w
     name: Grid
@@ -356,7 +364,7 @@ entities:
     color_negative: "#EF4444"
 ```
 
-### AC voltage with warning band
+### AC voltage with warning band and custom colours
 
 ```yaml
 type: custom:one-to-four-bar-chart
@@ -369,6 +377,10 @@ warn_below: 208
 warn_above: 253
 show_warning_lines: true
 label_warning_lines: true
+warn_above_color: "#EAB308"
+warn_below_color: "#EF4444"
+upper_bound_color: "#64748b"
+lower_bound_color: "#64748b"
 decimals: 0
 entities:
   - entity: sensor.phase_a_voltage
@@ -395,6 +407,7 @@ min_value: 0
 max_value: "{{ states('sensor.inverter_max_w') | float(0) * 0.001 }}"
 show_upper_bound: true
 label_upper_bound: true
+upper_bound_color: "#f59e0b"
 entities:
   - entity: sensor.house_load_w
     name: House
@@ -430,10 +443,12 @@ entities:
 |---------|------------------|
 | Card missing from picker | Resource URL, `type: module`, hard refresh |
 | Entity picker missing in editor | HA version / frontend load; fallback text field still works |
+| Colour pickers missing in editor | Hard-refresh the browser; ensure you have the latest `1_to_4_bar_chart.js` |
 | 24h scale looks wrong | Recorder enabled for those entities; **factor** applied to history and live values |
 | Bound line missing | Enable show upper/lower; ensure resolved min/max is valid; fixed mode needs Min/Max set |
 | Warning stripes not showing | Value must be outside `warn_above` / `warn_below`; thresholds must resolve to numbers |
 | Warning lines missing | Set thresholds; ensure `show_warning_lines` is true; value must fall within current scale (fixed min/max or auto expansion) |
+| Bound / warning / Y label colours not applied | Confirm the colour options are set (hex values); hard-refresh after updating the resource |
 | Template min/max/warn not updating | Valid Jinja; entity available; check browser console for subscribe errors |
 | more-info unreliable | Use latest file (hit target + render gating); click bar or series label |
 | Flickering bars | Ensure you have the version that only re-renders on relevant state changes |
@@ -451,6 +466,7 @@ entities:
 | `_barSegments` | Split bar into solid + warning-stripe segments |
 | `formatNumber` | Shared decimal formatting |
 | `_barFill` / `_gradientDef` | Solid vs gradient fills, ± colours |
+| Colour options | `upper_bound_color`, `lower_bound_color`, `warn_above_color`, `warn_below_color`, `y_label_color` applied to lines and labels |
 
 ---
 
