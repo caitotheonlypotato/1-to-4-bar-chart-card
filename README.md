@@ -5,7 +5,9 @@ A custom **Home Assistant Lovelace card** that displays **1–4 entities** as a 
 **Card type:** `custom:one-to-four-bar-chart`  
 **Resource file:** `1_to_4_bar_chart.js`
 
-![Card screenshot](screenshot.jpg)
+![Card screenshot 1](screenshot.jpg)
+
+![Card screenshot 2](screenshot2.jpg)
 
 ---
 
