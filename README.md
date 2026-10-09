@@ -35,9 +35,10 @@ It is **not** a multi-hour history graph. Bars show **current values** (optional
 | **Min/Max / warnings input** | Static number, `entity_id`, or Jinja template |
 | **Units** | Per-series factor (e.g. W → kW) and optional custom unit text |
 | **Labels** | Value labels (position + hover/tap/always), series name colours, optional Y-region labels with **custom colour** |
+| **Trend** | Optional **▲ / ▼** next to each value label (vs previous entity state); per-bar toggle + master “all bars” override; hides after 5 minutes with no change |
 | **Interaction** | Click bar or series name → entity **more-info** dialog |
 | **Appearance** | Title, icon, height scale, decimals, solid/gradient/image background |
-| **Editor** | Full UI editor (entity picker, icon picker, colour pickers for bounds / warnings / Y labels, etc.) |
+| **Editor** | Full UI editor (entity picker, icon picker, colour pickers for bounds / warnings / Y labels, trend checkboxes, etc.) |
 
 ---
 
@@ -110,6 +111,7 @@ Static methods on the card class:
 | `orientation` | `vertical` \| `horizontal` | `vertical` | Bar direction |
 | `value_label_position` | `top` \| `bottom` \| `both` \| `none` | `top` | Where value text sits relative to the bar (`top` = outer end, `bottom` = near baseline) |
 | `value_label_trigger` | `always` \| `hover` \| `tap` | `always` | When value labels are visible |
+| `show_trend_all` | boolean | `false` | Master override: when set in the editor, turns **on/off** `show_trend` on **every** entity |
 | `decimals` | number 0–6 | `1` | Decimal places for value, bound, and warning labels (trailing zeros trimmed) |
 | `scale_mode` | `auto` \| `fixed` \| `history_24h` | `auto` | How min/max of the chart are chosen |
 | `min_value` | number \| entity_id \| Jinja \| null | `null` | Scale minimum and/or lower bound source |
@@ -153,6 +155,47 @@ Static methods on the card class:
 | `color_mode` | `solid` \| `gradient` | `solid` | Fill style |
 | `color_end` | string | — | Gradient end colour (positive) |
 | `color_end_negative` | string | — | Gradient end colour (negative) |
+| `show_trend` | boolean | `false` | Show **▲ / ▼** next to this bar’s value label (vs previous entity state) |
+
+---
+
+## Trend triangles
+
+Optional direction indicator beside each value label.
+
+| Behaviour | Detail |
+|-----------|--------|
+| **Glyph** | `▲` when the value rose vs the previous state; `▼` when it fell |
+| **Placement** | Appended to the value label text (same position / trigger as the number: outer, baseline, both, or none) |
+| **Colour** | Same as the value label (inherits `.val-label` colour) |
+| **Source** | Compares current numeric state to the **last different** numeric state for that entity (tracked in the card instance) |
+| **Hide window** | Glyph is **hidden** if there has been no change for **5 minutes**; a timer re-renders so it disappears without waiting for another state update |
+| **First sample** | No glyph until at least one real change has been observed after the card loaded |
+| **Equal values** | No glyph when current equals previous |
+
+### Editor controls
+
+- **Per bar:** checkbox *“Show trend ▲/▼ (vs previous value)”* inside each entity box  
+- **Master:** *“Show trend on all bars”* under Label & Scale Options — sets every entity’s `show_trend` to on or off together  
+- Changing individual bars keeps the master checkbox in sync (checked only when **all** bars have trend enabled)
+
+### YAML example
+
+```yaml
+type: custom:one-to-four-bar-chart
+title: Batteries
+entities:
+  - entity: sensor.pw_batt_1_soc
+    name: Batt 1
+    unit: "%"
+    color: "#3B82F6"
+    show_trend: true
+  - entity: sensor.pw_batt_2_soc
+    name: Batt 2
+    unit: "%"
+    color: "#10B981"
+    show_trend: true
+```
 
 ---
 
@@ -268,22 +311,24 @@ Clicks use a full column/row hit target so more-info works reliably on the bar a
 | Step | What happens |
 |------|----------------|
 | `setConfig(config)` | Merges defaults, validates `entities`, sets up min/max/warn resolvers, optional history fetch, renders |
-| `set hass(hass)` | Updates entity data; skips full re-render if watched states are unchanged (reduces flicker); refreshes entity-based bounds/warnings |
-| `disconnectedCallback` | Unsubscribes Jinja template listeners |
+| `set hass(hass)` | Updates trend state; updates entity data; skips full re-render if watched states are unchanged (reduces flicker); refreshes entity-based bounds/warnings |
+| `disconnectedCallback` | Unsubscribes Jinja template listeners; clears trend hide timer |
 
 ### Rendering pipeline (simplified)
 
 1. Read up to 4 entities → apply **factor** → build bar values  
 2. Resolve scale via `getMinMaxValues` (auto / fixed / history + bound & warning range)  
 3. Split each bar into solid + optional warning-stripe segments  
-4. Build SVG: bars, labels, zero/bound/warning lines (with configured colours), patterns, optional gradients  
+4. Build SVG: bars, labels (with optional trend glyphs), zero/bound/warning lines (with configured colours), patterns, optional gradients  
 5. Apply background, title, icon  
+6. Schedule trend hide timer if any active trend is within the 5-minute window  
 
 ### Performance notes
 
 - Full SVG rebuild only when a **watched entity state** changes (series entities + entity-type min/max/warnings)  
 - Template fields update via subscription and trigger their own render  
 - Hover styles avoid CSS `filter` on bars (that caused unreliable clicks / flicker in SVG)  
+- Trend hide uses a single timeout so glyphs clear after 5 minutes without continuous polling  
 
 ---
 
@@ -298,9 +343,11 @@ Opened from the standard Lovelace **Configure card** UI (`getConfigElement()`).
 - **Entities** (up to 4):
   - `ha-entity-picker` when HA components load successfully  
   - Label, label colour, unit, factor  
+  - **Show trend** checkbox per series  
   - Fill mode (solid/gradient), bar + / − colours, gradient ends  
   - Add / remove series  
 - **Orientation**, value label position & trigger  
+- **Show trend on all bars** master checkbox (bulk-sets each series’ `show_trend`)  
 - **Scale mode**, Min/Max (text — number / entity / template)  
 - Zero line, reference line toggles + labels + **colour pickers** for upper/lower bounds  
 - **Warning thresholds** (warn if below / above, show lines, label lines) + **separate colour pickers** for above/below warning lines  
@@ -314,12 +361,13 @@ Opened from the standard Lovelace **Configure card** UI (`getConfigElement()`).
 - Structural changes (scale mode, background type, entity count, etc.) re-render the form; value-only changes **sync in place** where possible  
 - Loads `ha-entity-picker` / `ha-icon-picker` by invoking known HA card config elements when needed  
 - Colour pickers for bounds, warnings, and Y labels sit next to their related checkboxes so the form stays organised  
+- Master trend toggle writes `show_trend` on every entity; individual trend toggles update `show_trend_all` so the master stays consistent  
 
 ---
 
 ## YAML examples
 
-### SOC with 100% ceiling
+### SOC with 100% ceiling and trends
 
 ```yaml
 type: custom:one-to-four-bar-chart
@@ -337,10 +385,12 @@ entities:
     name: Batt 1
     color: "#3B82F6"
     unit: "%"
+    show_trend: true
   - entity: sensor.pw_batt_2_soc
     name: Batt 2
     color: "#10B981"
     unit: "%"
+    show_trend: true
 ```
 
 ### Power in kW with factor and ± colours
@@ -362,6 +412,7 @@ entities:
     unit: kW
     color: "#3B82F6"
     color_negative: "#EF4444"
+    show_trend: true
 ```
 
 ### AC voltage with warning band and custom colours
@@ -387,14 +438,17 @@ entities:
     name: Phase A
     unit: V
     color: "#3B82F6"
+    show_trend: true
   - entity: sensor.phase_b_voltage
     name: Phase B
     unit: V
     color: "#3B82F6"
+    show_trend: true
   - entity: sensor.phase_c_voltage
     name: Phase C
     unit: V
     color: "#3B82F6"
+    show_trend: true
 ```
 
 ### Dynamic max from template
@@ -444,6 +498,9 @@ entities:
 | Card missing from picker | Resource URL, `type: module`, hard refresh |
 | Entity picker missing in editor | HA version / frontend load; fallback text field still works |
 | Colour pickers missing in editor | Hard-refresh the browser; ensure you have the latest `1_to_4_bar_chart.js` |
+| Trend checkbox / master missing | Hard-refresh; confirm resource is the version that includes `show_trend` |
+| Trend triangle never appears | Enable `show_trend` on the series; wait for the entity state to **change** at least once after the card loaded |
+| Trend stays forever | Should clear after 5 minutes of no change; if not, hard-refresh and confirm the latest file (includes `_scheduleTrendHide`) |
 | 24h scale looks wrong | Recorder enabled for those entities; **factor** applied to history and live values |
 | Bound line missing | Enable show upper/lower; ensure resolved min/max is valid; fixed mode needs Min/Max set |
 | Warning stripes not showing | Value must be outside `warn_above` / `warn_below`; thresholds must resolve to numbers |
@@ -467,6 +524,7 @@ entities:
 | `formatNumber` | Shared decimal formatting |
 | `_barFill` / `_gradientDef` | Solid vs gradient fills, ± colours |
 | Colour options | `upper_bound_color`, `lower_bound_color`, `warn_above_color`, `warn_below_color`, `y_label_color` applied to lines and labels |
+| Trend | `_trendState`, `_updateTrendState`, `_getTrendGlyph`, `_scheduleTrendHide`; per-entity `show_trend` + editor master `show_trend_all` |
 
 ---
 
