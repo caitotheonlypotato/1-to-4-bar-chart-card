@@ -210,6 +210,8 @@ Scale uses resolved **Min** and **Max**. Those values are also used for bound li
 ### 24h history (`history_24h`)
 Fetches 24 hours of history via the WebSocket API (`history/history_during_period`), applies each series’ **factor**, and sets scale from the combined history + current values. Warning thresholds are included in the range when set. Useful so a short bar still sits in a meaningful daily context.
 
+**Fetch behaviour:** The history query runs **once** when the card is first created or its configuration changes (entities / scale mode). It is **not** repeated on every entity state update. The resulting min/max are held for the life of that card instance (until a browser refresh or the card is destroyed and re-created). On systems with a large recorder database this single query can cause a brief CPU spike while the history is retrieved; after that the card behaves like any other live-value card.
+
 ---
 
 ## Min / Max / warnings: numbers, entities, and templates
@@ -329,6 +331,7 @@ Clicks use a full column/row hit target so more-info works reliably on the bar a
 - Template fields update via subscription and trigger their own render  
 - Hover styles avoid CSS `filter` on bars (that caused unreliable clicks / flicker in SVG)  
 - Trend hide uses a single timeout so glyphs clear after 5 minutes without continuous polling  
+- **24h history scale:** history is fetched **once** per card instance (on first load or config change), not on every state change. A large recorder database may produce a short CPU spike during that single fetch; afterwards there is no ongoing history load from this card.  
 
 ---
 
@@ -537,6 +540,13 @@ entities:
 
 ---
 
-## License / usage
+## Disclaimer / License
 
-Provide and maintain this file as part of your own HA config or share it as you prefer. No external npm package is required; it is a single self-contained module.
+**This card is provided as-is, with no warranty of any kind, express or implied.** That includes, without limitation, any implied warranties of merchantability, fitness for a particular purpose, or non-infringement. Use at your own risk.
+
+- Results can vary between Home Assistant versions, browsers, hardware, and database sizes.  
+- Always **back up** your configuration and recorder database before installing or updating custom resources.  
+- The author accepts **no liability** for data loss, performance problems, broken dashboards, or any other damage arising from installing, configuring, or using this card.  
+- If something goes wrong, restore from your backup; do not assume the card or its documentation will protect you from misconfiguration or system issues.
+
+You may use, copy, and modify this single-file module in your own Home Assistant setup or share it as you prefer. No external npm package is required.
