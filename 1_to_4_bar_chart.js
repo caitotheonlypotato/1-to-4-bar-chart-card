@@ -1,552 +1,1827 @@
-# 1 to 4 Bar Chart
+// Register card with Home Assistant UI Card Picker
+window.customCards = window.customCards || [];
+if (!window.customCards.some(card => card.type === "one-to-four-bar-chart")) {
+  window.customCards.push({
+    type: "one-to-four-bar-chart",
+    name: "1 to 4 Bar Chart",
+    description: "A custom multi-entity bar chart card (vertical or horizontal) with GUI config editor.",
+    preview: true,
+  });
+}
 
-A custom **Home Assistant Lovelace card** that displays **1–4 entities** as a vertical or horizontal bar chart, with a full GUI configuration editor.
+class OneToFourBarChartCard extends HTMLElement {
+  constructor() {
+    super();
+    this.attachShadow({ mode: 'open' });
+    this._config = {};
+    this._hass = null;
+    this._historyData = {};
+    this._fetchedHistory = false;
+    // Resolved numeric min/max/warnings (from number, entity_id, or Jinja template)
+    this._resolvedMin = null;
+    this._resolvedMax = null;
+    this._resolvedWarnAbove = null;
+    this._resolvedWarnBelow = null;
+    this._boundUnsubs = [];
+    this._boundSourceKey = '';
+    // Per-entity trend tracking: { [entityId]: { prevVal, lastVal, lastChangeAt } }
+    this._trendState = {};
+    this._trendHideTimer = null;
+    // One-time delegation — survives full SVG re-renders
+    this.shadowRoot.addEventListener('click', (ev) => this._onBarActivate(ev));
+    this.shadowRoot.addEventListener('keydown', (ev) => {
+      if (ev.key === 'Enter' || ev.key === ' ') this._onBarActivate(ev);
+    });
+  }
 
-**Card type:** `custom:one-to-four-bar-chart`  
-**Resource file:** `1_to_4_bar_chart.js`
+  disconnectedCallback() {
+    this._clearBoundSubscriptions();
+    if (this._trendHideTimer) {
+      clearTimeout(this._trendHideTimer);
+      this._trendHideTimer = null;
+    }
+  }
 
-![Card screenshot](screenshot.jpg)
+  // Mandatory static method for HA Editor link
+  static getConfigElement() {
+    return document.createElement('one-to-four-bar-chart-editor');
+  }
 
----
+  // Mandatory static method for HA Default Stub Config
+  static getStubConfig() {
+    return {
+      title: "Bar Chart Comparison",
+      icon: "",
+      entities: [
+        { entity: "sensor.temperature", name: "Temp 1", color: "#3B82F6", color_negative: "", color_mode: "solid", color_end: "", color_end_negative: "", unit: "", factor: 1, show_trend: false },
+        { entity: "sensor.temperature_2", name: "Temp 2", color: "#10B981", color_negative: "", color_mode: "solid", color_end: "", color_end_negative: "", unit: "", factor: 1, show_trend: false }
+      ],
+      orientation: "vertical",
+      value_label_position: "top",
+      value_label_trigger: "always",
+      decimals: 1,
+      scale_mode: "auto",
+      min_value: null,
+      max_value: null,
+      show_zero_line: true,
+      show_upper_bound: false,
+      show_lower_bound: false,
+      label_upper_bound: false,
+      label_lower_bound: false,
+      upper_bound_color: "#ffffff",
+      lower_bound_color: "#ffffff",
+      warn_above: null,
+      warn_below: null,
+      show_warning_lines: true,
+      label_warning_lines: false,
+      warn_above_color: "#EAB308",
+      warn_below_color: "#EAB308",
+      show_y_labels: false,
+      y_label_above: "",
+      y_label_below: "",
+      y_label_color: "#9ca3af",
+      height_scale: 1,
+      background_type: "solid",
+      bg_color: "var(--ha-card-background, #1c1c1e)",
+      bg_gradient_start: "#1f2937",
+      bg_gradient_end: "#111827",
+      bg_image_url: "",
+      bg_image_fit: "cover",
+      bg_opacity: 0.2
+    };
+  }
 
-## What it’s for
+  set hass(hass) {
+    const oldHass = this._hass;
+    this._hass = hass;
 
-Use this card when you want a compact comparison of a few related sensors on a dashboard, for example:
+    // Track previous values for trend triangles (before any early return)
+    this._updateTrendState(oldHass, hass);
 
-- Battery / Powerwall state of charge (SOC) side by side  
-- Solar production (house vs shed vs total)  
-- Grid import vs export  
-- AC voltage per phase (with warning thresholds)  
-- Temperatures, loads, or any numeric sensors  
+    // Fetch history ONLY once when scale_mode is history_24h
+    if (this._config.scale_mode === 'history_24h' && !this._fetchedHistory) {
+      this.fetch24hHistory();
+    }
 
-It is **not** a multi-hour history graph. Bars show **current values** (optionally scaled against a 24h history range or fixed limits).
+    // Keep entity-based min/max in sync; templates update via subscription
+    this._syncEntityBounds();
 
----
+    // (Re)subscribe templates when hass first arrives
+    if (!oldHass && hass) {
+      this._setupBoundResolvers();
+    }
 
-## Features overview
+    // Skip full DOM rebuild if none of our watched states changed
+    if (!this._entityStatesChanged(oldHass, hass)) {
+      return;
+    }
 
-| Area | Capabilities |
-|------|----------------|
-| **Series** | 1–4 entities, custom labels, units, colour, ± colours, gradients |
-| **Layout** | Vertical or horizontal bars |
-| **Scale** | Auto, fixed min/max, or 24h history extremes |
-| **Bounds** | Optional upper/lower reference lines with labels and **custom colours** |
-| **Warnings** | Warn-if-above / warn-if-below thresholds; hazard stripes on out-of-spec bar segments; optional warning lines with **custom colours** |
-| **Min/Max / warnings input** | Static number, `entity_id`, or Jinja template |
-| **Units** | Per-series factor (e.g. W → kW) and optional custom unit text |
-| **Labels** | Value labels (position + hover/tap/always), series name colours, optional Y-region labels with **custom colour** |
-| **Trend** | Optional **▲ / ▼** next to each value label (vs previous entity state); per-bar toggle + master “all bars” override; hides after 5 minutes with no change |
-| **Interaction** | Click bar or series name → entity **more-info** dialog |
-| **Appearance** | Title, icon, height scale, decimals, solid/gradient/image background |
-| **Editor** | Full UI editor (entity picker, icon picker, colour pickers for bounds / warnings / Y labels, trend checkboxes, etc.) |
+    this.render();
+  }
 
----
+  /**
+   * Track last / previous numeric values per entity so we can show ▲/▼
+   * vs the previous state. lastChangeAt is used to hide the glyph after 5 min of no change.
+   */
+  _updateTrendState(oldHass, newHass) {
+    if (!this._config?.entities || !newHass) return;
+    const now = Date.now();
+    for (const item of this._config.entities) {
+      const id = item.entity;
+      if (!id) continue;
+      const raw = newHass.states?.[id]?.state;
+      const newVal = raw !== undefined ? parseFloat(raw) : NaN;
+      if (!Number.isFinite(newVal)) continue;
 
-## Installation
+      const t = this._trendState[id];
+      if (!t) {
+        this._trendState[id] = { prevVal: null, lastVal: newVal, lastChangeAt: 0 };
+        continue;
+      }
+      if (t.lastVal !== null && newVal !== t.lastVal) {
+        t.prevVal = t.lastVal;
+        t.lastVal = newVal;
+        t.lastChangeAt = now;
+      } else {
+        t.lastVal = newVal;
+      }
+    }
+  }
 
-1. Copy `1_to_4_bar_chart.js` to your HA config, e.g.  
-   `config/www/1_to_4_bar_chart.js`
-2. Add a Lovelace resource (Dashboard → ⋮ → Resources, or YAML):
+  /**
+   * Return ' ▲' / ' ▼' / '' for the value label.
+   * Hidden when show_trend is off, no prior sample, or no change for ≥ 5 minutes.
+   */
+  _getTrendGlyph(entityId, showTrend) {
+    if (!showTrend || !entityId) return '';
+    const t = this._trendState[entityId];
+    if (!t || t.prevVal === null || t.lastVal === null) return '';
+    if (!t.lastChangeAt || (Date.now() - t.lastChangeAt) > 5 * 60 * 1000) return '';
+    if (t.lastVal > t.prevVal) return ' ▲';
+    if (t.lastVal < t.prevVal) return ' ▼';
+    return '';
+  }
 
-```yaml
-url: /local/1_to_4_bar_chart.js
-type: module
-```
+  /** Re-render once the soonest active trend reaches the 5-minute hide window */
+  _scheduleTrendHide() {
+    if (this._trendHideTimer) {
+      clearTimeout(this._trendHideTimer);
+      this._trendHideTimer = null;
+    }
+    if (!this._config?.entities) return;
+    const now = Date.now();
+    const WINDOW_MS = 5 * 60 * 1000;
+    let soonest = null;
+    for (const item of this._config.entities) {
+      if (!item.show_trend || !item.entity) continue;
+      const t = this._trendState[item.entity];
+      if (!t?.lastChangeAt || t.prevVal === null) continue;
+      const remaining = t.lastChangeAt + WINDOW_MS - now;
+      if (remaining <= 0) continue;
+      if (soonest === null || remaining < soonest) soonest = remaining;
+    }
+    if (soonest !== null) {
+      this._trendHideTimer = setTimeout(() => {
+        this._trendHideTimer = null;
+        this.render();
+      }, soonest + 50);
+    }
+  }
 
-3. Reload resources / refresh the browser (hard refresh if needed).
-4. Add card → search **“1 to 4 Bar Chart”**, or use YAML:
+  _entityStatesChanged(oldHass, newHass) {
+    if (!oldHass || !this._config) return true;
+    const ids = [];
+    for (const item of this._config.entities || []) {
+      if (item.entity) ids.push(item.entity);
+    }
+    // Also watch entity_ids used as min/max/warning bounds
+    for (const key of ['min_value', 'max_value', 'warn_above', 'warn_below']) {
+      const v = this._config[key];
+      if (v != null && this._isEntityId(String(v))) ids.push(String(v).trim());
+    }
+    for (const id of ids) {
+      const a = oldHass.states[id];
+      const b = newHass.states[id];
+      if (!a && !b) continue;
+      if (!a || !b) return true;
+      if (a.state !== b.state) return true;
+    }
+    return false;
+  }
 
-```yaml
-type: custom:one-to-four-bar-chart
-title: Powerwall Batteries SOC
-entities:
-  - entity: sensor.battery_1_soc
-    name: Batt 1
-    color: "#3B82F6"
-```
+  setConfig(config) {
+    if (!config.entities || !Array.isArray(config.entities)) {
+      throw new Error("Please define entities array");
+    }
+    this._config = {
+      title: "Bar Chart",
+      icon: "",
+      entities: [],
+      orientation: "vertical",
+      value_label_position: "top",
+      value_label_trigger: "always",
+      decimals: 1,
+      scale_mode: "auto",
+      min_value: null,
+      max_value: null,
+      show_zero_line: true,
+      show_upper_bound: false,
+      show_lower_bound: false,
+      label_upper_bound: false,
+      label_lower_bound: false,
+      upper_bound_color: "#ffffff",
+      lower_bound_color: "#ffffff",
+      warn_above: null,
+      warn_below: null,
+      show_warning_lines: true,
+      label_warning_lines: false,
+      warn_above_color: "#EAB308",
+      warn_below_color: "#EAB308",
+      show_y_labels: false,
+      y_label_above: "",
+      y_label_below: "",
+      y_label_color: "#9ca3af",
+      height_scale: 1,
+      background_type: "solid",
+      bg_color: "var(--ha-card-background, #1c1c1e)",
+      bg_gradient_start: "#1f2937",
+      bg_gradient_end: "#111827",
+      bg_image_url: "",
+      bg_image_fit: "cover",
+      bg_opacity: 0.2,
+      ...config
+    };
 
-The script **self-registers** with Home Assistant’s card picker via `window.customCards` (see [Self-registration](#self-registration) below). You do not need a separate `card-tools` dependency.
+    // Reset history flag when config changes so a new fetch can happen if needed
+    this._fetchedHistory = false;
 
----
+    if (this._config.scale_mode === 'history_24h' && this._hass) {
+      this.fetch24hHistory();
+    }
+    this._setupBoundResolvers();
+    this.render();
+  }
 
-## Self-registration
+  async fetch24hHistory() {
+    if (!this._hass || !this._config.entities) return;
+    const entityIds = this._config.entities.map(e => e.entity).filter(Boolean);
+    if (entityIds.length === 0) return;
 
-On load, the file:
+    const endTime = new Date();
+    const startTime = new Date(endTime.getTime() - 24 * 60 * 60 * 1000);
 
-1. Pushes a card definition into `window.customCards` so it appears in the **Add card** UI  
-2. Defines two custom elements:
-   - `one-to-four-bar-chart` — the card  
-   - `one-to-four-bar-chart-editor` — the visual editor  
+    try {
+      const history = await this._hass.callWS({
+        type: 'history/history_during_period',
+        start_time: startTime.toISOString(),
+        end_time: endTime.toISOString(),
+        entity_ids: entityIds,
+        include_start_time_state: true,
+        no_attributes: true
+      });
 
-```js
-window.customCards.push({
-  type: "one-to-four-bar-chart",
-  name: "1 to 4 Bar Chart",
-  description: "...",
-  preview: true,
-});
+      this._historyData = history;
+      this._fetchedHistory = true;          // ← now only set once
+      this.render();
+    } catch (err) {
+      console.warn("Failed to fetch history for 1-to-4-bar-chart:", err);
+    }
+  }
 
+  /** True if config has a non-empty min/max expression (number, entity, or template) */
+  _hasBoundConfig(v) {
+    return v !== null && v !== undefined && String(v).trim() !== '';
+  }
+
+  _isTemplate(v) {
+    const s = String(v);
+    return s.includes('{{') || s.includes('{%');
+  }
+
+  _isEntityId(v) {
+    return /^[a-z0-9_]+\.[a-z0-9_]+$/i.test(String(v).trim());
+  }
+
+  _parseNumericResult(raw) {
+    if (raw === null || raw === undefined) return null;
+    const n = parseFloat(typeof raw === 'object' && raw !== null && 'result' in raw ? raw.result : raw);
+    return Number.isFinite(n) ? n : null;
+  }
+
+  _clearBoundSubscriptions() {
+    (this._boundUnsubs || []).forEach((unsub) => {
+      try {
+        if (typeof unsub === 'function') unsub();
+      } catch (e) { /* ignore */ }
+    });
+    this._boundUnsubs = [];
+    this._boundSourceKey = '';
+  }
+
+  /**
+   * Resolve min/max/warn fields which may be:
+   *  - static number: "100"
+   *  - entity_id: "sensor.foo"
+   *  - Jinja: "{{ states('sensor.foo') | float }}"
+   */
+  _setupBoundResolvers() {
+    const minRaw = this._config?.min_value;
+    const maxRaw = this._config?.max_value;
+    const warnAboveRaw = this._config?.warn_above;
+    const warnBelowRaw = this._config?.warn_below;
+    const sourceKey = `${minRaw ?? ''}|${maxRaw ?? ''}|${warnAboveRaw ?? ''}|${warnBelowRaw ?? ''}`;
+    // Avoid resubscribing if expressions unchanged and already wired
+    if (sourceKey === this._boundSourceKey && this._boundUnsubs.length) {
+      this._syncEntityBounds();
+      return;
+    }
+    this._clearBoundSubscriptions();
+    this._boundSourceKey = sourceKey;
+
+    this._resolvedMin = this._resolveBoundSyncFor(minRaw, null);
+    this._resolvedMax = this._resolveBoundSyncFor(maxRaw, null);
+    this._resolvedWarnAbove = this._resolveBoundSyncFor(warnAboveRaw, null);
+    this._resolvedWarnBelow = this._resolveBoundSyncFor(warnBelowRaw, null);
+
+    if (this._hass) {
+      this._subscribeBoundTemplate('min_value', 'min');
+      this._subscribeBoundTemplate('max_value', 'max');
+      this._subscribeBoundTemplate('warn_above', 'warnAbove');
+      this._subscribeBoundTemplate('warn_below', 'warnBelow');
+    }
+  }
+
+  _resolveBoundSyncFor(raw, previous) {
+    if (!this._hasBoundConfig(raw)) return null;
+    const str = String(raw).trim();
+    if (this._isTemplate(str)) return previous; // templates arrive async via subscription
+    if (this._isEntityId(str)) {
+      if (!this._hass || !this._hass.states[str]) return previous;
+      const n = this._parseNumericResult(this._hass.states[str].state);
+      return n === null ? previous : n;
+    }
+    return this._parseNumericResult(str);
+  }
+
+  _syncEntityBounds() {
+    if (!this._config) return;
+    if (!this._isTemplate(String(this._config.min_value ?? ''))) {
+      this._resolvedMin = this._resolveBoundSyncFor(this._config.min_value, this._resolvedMin);
+    }
+    if (!this._isTemplate(String(this._config.max_value ?? ''))) {
+      this._resolvedMax = this._resolveBoundSyncFor(this._config.max_value, this._resolvedMax);
+    }
+    if (!this._isTemplate(String(this._config.warn_above ?? ''))) {
+      this._resolvedWarnAbove = this._resolveBoundSyncFor(this._config.warn_above, this._resolvedWarnAbove);
+    }
+    if (!this._isTemplate(String(this._config.warn_below ?? ''))) {
+      this._resolvedWarnBelow = this._resolveBoundSyncFor(this._config.warn_below, this._resolvedWarnBelow);
+    }
+  }
+
+  _subscribeBoundTemplate(configKey, which) {
+    const raw = this._config[configKey];
+    if (!this._hasBoundConfig(raw) || !this._isTemplate(String(raw)) || !this._hass?.connection) {
+      return;
+    }
+    const template = String(raw).trim();
+    try {
+      const unsubPromise = this._hass.connection.subscribeMessage(
+        (msg) => {
+          const n = this._parseNumericResult(msg);
+          if (which === 'min') this._resolvedMin = n;
+          else if (which === 'max') this._resolvedMax = n;
+          else if (which === 'warnAbove') this._resolvedWarnAbove = n;
+          else if (which === 'warnBelow') this._resolvedWarnBelow = n;
+          this.render();
+        },
+        { type: 'render_template', template }
+      );
+      Promise.resolve(unsubPromise).then((unsub) => {
+        if (typeof unsub === 'function') this._boundUnsubs.push(unsub);
+      }).catch((err) => {
+        console.warn('1-to-4-bar-chart: template subscribe failed', configKey, err);
+      });
+    } catch (err) {
+      console.warn('1-to-4-bar-chart: template subscribe error', configKey, err);
+    }
+  }
+
+  /**
+   * Split a bar [fromVal → toVal] into solid + optional warning-stripe segments.
+   * Returns array of { from, to, warn } in value-space (caller maps to pixels).
+   */
+  _barSegments(val, baselineVal, warnAbove, warnBelow) {
+    const lo = Math.min(baselineVal, val);
+    const hi = Math.max(baselineVal, val);
+    if (hi === lo) return [{ from: lo, to: hi, warn: false }];
+
+    const hasHi = warnAbove !== null && Number.isFinite(warnAbove);
+    const hasLo = warnBelow !== null && Number.isFinite(warnBelow);
+
+    // Value above upper warning → stripe the excess tip
+    if (hasHi && val > warnAbove) {
+      const split = Math.max(lo, Math.min(hi, warnAbove));
+      const segs = [];
+      if (split > lo) segs.push({ from: lo, to: split, warn: false });
+      if (hi > split) segs.push({ from: split, to: hi, warn: true });
+      return segs.length ? segs : [{ from: lo, to: hi, warn: false }];
+    }
+
+    // Value below lower warning → stripe the excess tip
+    if (hasLo && val < warnBelow) {
+      const split = Math.max(lo, Math.min(hi, warnBelow));
+      const segs = [];
+      if (split > lo) segs.push({ from: lo, to: split, warn: true });
+      if (hi > split) segs.push({ from: split, to: hi, warn: false });
+      return segs.length ? segs : [{ from: lo, to: hi, warn: false }];
+    }
+
+    return [{ from: lo, to: hi, warn: false }];
+  }
+
+  /** Format a number with configured decimals; trim trailing zeros */
+  formatNumber(v) {
+    const decimals = Math.max(0, Math.min(6, Number(this._config.decimals ?? 1)));
+    const n = Number(v);
+    if (isNaN(n)) return String(v);
+    const fixed = n.toFixed(decimals);
+    if (decimals === 0) return fixed;
+    return fixed.replace(/\.?0+$/, '');
+  }
+
+  /** Resolve bar fill (solid or gradient id) for a series */
+  _barFill(d, idx, isHorizontal) {
+    const isNeg = d.val < 0;
+    const c1 = isNeg ? (d.colorNegative || d.color) : d.color;
+    const c2 = isNeg
+      ? (d.colorEndNegative || d.colorEnd || c1)
+      : (d.colorEnd || c1);
+    if (d.colorMode === 'gradient' && c2 && c2 !== c1) {
+      return { fill: `url(#bar-grad-${idx})`, c1, c2, isNeg };
+    }
+    return { fill: c1, c1, c2: c1, isNeg };
+  }
+
+  _gradientDef(idx, c1, c2, isHorizontal, isNeg) {
+    // Gradient runs from baseline → tip of the bar
+    let x1 = 0, y1 = 0, x2 = 0, y2 = 0;
+    if (isHorizontal) {
+      if (isNeg) { x1 = 1; x2 = 0; }
+      else { x1 = 0; x2 = 1; }
+    } else {
+      if (isNeg) { y1 = 0; y2 = 1; }
+      else { y1 = 1; y2 = 0; }
+    }
+    return `<linearGradient id="bar-grad-${idx}" x1="${x1}" y1="${y1}" x2="${x2}" y2="${y2}">
+      <stop offset="0%" stop-color="${c1}"/>
+      <stop offset="100%" stop-color="${c2}"/>
+    </linearGradient>`;
+  }
+
+  getMinMaxValues(barValues, entityFactors = {}) {
+    let min = 0;
+    let max = 100;
+    const mode = this._config.scale_mode || 'auto';
+    // Resolved from number / entity_id / Jinja
+    const resolvedMin = this._resolvedMin;
+    const resolvedMax = this._resolvedMax;
+    const hasMin = resolvedMin !== null && Number.isFinite(resolvedMin);
+    const hasMax = resolvedMax !== null && Number.isFinite(resolvedMax);
+
+    if (mode === 'fixed') {
+      min = hasMin ? resolvedMin : 0;
+      max = hasMax ? resolvedMax : 100;
+    } else if (mode === 'history_24h' && Object.keys(this._historyData).length > 0) {
+      let allHistVals = [];
+      Object.entries(this._historyData).forEach(([entityId, entries]) => {
+        const factor = entityFactors[entityId] ?? 1;
+        const list = Array.isArray(entries) ? entries : [];
+        list.forEach(entry => {
+          if (!entry) return;
+          const raw = entry.s !== undefined ? entry.s : entry.state;
+          const val = parseFloat(raw);
+          if (!isNaN(val)) allHistVals.push(val * factor);
+        });
+      });
+      if (allHistVals.length > 0) {
+        min = Math.min(...allHistVals, ...barValues);
+        max = Math.max(...allHistVals, ...barValues);
+        if (min < 0) min = min * 1.05;
+        if (max > 0) max = max * 1.05;
+      } else if (barValues.length > 0) {
+        min = Math.min(...barValues, 0);
+        max = Math.max(...barValues, 10);
+      }
+    } else {
+      // Auto: current values
+      if (barValues.length > 0) {
+        const valMin = Math.min(...barValues);
+        const valMax = Math.max(...barValues);
+        min = valMin < 0 ? valMin * 1.1 : 0;
+        max = valMax > 0 ? valMax * 1.15 : 10;
+      }
+    }
+
+    // Optional bound / warning overrides expand auto/24h scale so lines always sit on-plot
+    if (mode !== 'fixed') {
+      if (this._config.show_upper_bound && hasMax) {
+        max = Math.max(max, resolvedMax);
+      }
+      if (this._config.show_lower_bound && hasMin) {
+        min = Math.min(min, resolvedMin);
+      }
+      const wa = this._resolvedWarnAbove;
+      const wb = this._resolvedWarnBelow;
+      if (wa !== null && Number.isFinite(wa)) {
+        max = Math.max(max, wa);
+        min = Math.min(min, wa);
+      }
+      if (wb !== null && Number.isFinite(wb)) {
+        max = Math.max(max, wb);
+        min = Math.min(min, wb);
+      }
+    }
+
+    if (min === max) {
+      max = min + 10;
+    }
+
+    // Line positions: explicit override if set, else the scale edge (computed or fixed)
+    let upperBound = null;
+    let lowerBound = null;
+    if (this._config.show_upper_bound) {
+      if (mode === 'fixed') {
+        upperBound = max;
+      } else if (hasMax) {
+        upperBound = resolvedMax;
+      } else {
+        upperBound = max; // peak of auto/history scale
+      }
+    }
+    if (this._config.show_lower_bound) {
+      if (mode === 'fixed') {
+        lowerBound = min;
+      } else if (hasMin) {
+        lowerBound = resolvedMin;
+      } else {
+        lowerBound = min;
+      }
+    }
+
+    return { min, max, upperBound, lowerBound };
+  }
+
+  render() {
+    if (!this._config || !this.shadowRoot) return;
+
+    const entitiesConfig = (this._config.entities || []).slice(0, 4);
+
+    // Extract data (apply per-entity factor for unit conversion e.g. W→kW)
+    const entityFactors = {};
+    const barData = entitiesConfig.map((item, idx) => {
+      const entityId = item.entity;
+      const stateObj = this._hass && entityId ? this._hass.states[entityId] : null;
+      const rawVal = stateObj ? parseFloat(stateObj.state) : NaN;
+      const factor = Number(item.factor ?? 1) || 1;
+      if (entityId) entityFactors[entityId] = factor;
+      const val = isNaN(rawVal) ? 0 : rawVal * factor;
+      const unit = item.unit || (stateObj && stateObj.attributes.unit_of_measurement) || "";
+      const name = item.name || (stateObj && stateObj.attributes.friendly_name) || entityId || `Bar ${idx + 1}`;
+      const color = item.color || ["#3B82F6", "#10B981", "#F59E0B", "#EF4444"][idx];
+      const nameColor = item.name_color || "";
+      const colorNegative = item.color_negative || "";
+      const colorMode = item.color_mode === 'gradient' ? 'gradient' : 'solid';
+      const colorEnd = item.color_end || "";
+      const colorEndNegative = item.color_end_negative || "";
+      const showTrend = !!item.show_trend;
+
+      return {
+        val, unit, name, color, nameColor, entityId, stateObj, factor,
+        colorNegative, colorMode, colorEnd, colorEndNegative, showTrend,
+      };
+    });
+
+    const values = barData.map(d => d.val);
+    const { min, max, upperBound, lowerBound } = this.getMinMaxValues(values, entityFactors);
+    // Unit for bound labels: first series custom unit or entity unit
+    const boundUnit = (barData[0] && barData[0].unit) ? ` ${barData[0].unit}` : '';
+
+    // Configurable colours for bounds / warnings / Y labels
+    const upperBoundColor = this._config.upper_bound_color || '#ffffff';
+    const lowerBoundColor = this._config.lower_bound_color || '#ffffff';
+    const warnAboveColor = this._config.warn_above_color || '#EAB308';
+    const warnBelowColor = this._config.warn_below_color || '#EAB308';
+    const yLabelColor = this._config.y_label_color || '#9ca3af';
+
+    // Dynamic background styles
+    let bgStyle = "";
+    if (this._config.background_type === "gradient") {
+      bgStyle = `background: linear-gradient(135deg, ${this._config.bg_gradient_start}, ${this._config.bg_gradient_end});`;
+    } else if (this._config.background_type === "image" && this._config.bg_image_url) {
+      bgStyle = `background-image: url('${this._config.bg_image_url}'); background-size: ${this._config.bg_image_fit}; background-position: center;`;
+    } else {
+      bgStyle = `background: ${this._config.bg_color};`;
+    }
+
+    // Orientation + dimensions
+    const isHorizontal = (this._config.orientation || 'vertical') === 'horizontal';
+    const heightScale = Math.max(0.5, Math.min(3, Number(this._config.height_scale ?? 1) || 1));
+    const svgWidth = 400;
+    // Horizontal mode benefits from a bit more height per bar row
+    const baseH = isHorizontal ? 200 : 220;
+    const svgHeight = Math.round(baseH * heightScale);
+    const showYLabels = !!this._config.show_y_labels &&
+      (!!this._config.y_label_above || !!this._config.y_label_below);
+
+    const posSetting = this._config.value_label_position || 'top';
+    // "top" = outer end of bar; "bottom" = near baseline (both orientations)
+    const showOuter = posSetting === 'top' || posSetting === 'both';
+    const showInner = posSetting === 'bottom' || posSetting === 'both';
+
+    const crossesZero = min < 0 && max > 0;
+    const hasZeroLine = this._config.show_zero_line && crossesZero;
+    const range = (max - min) || 1;
+
+    const valFontSize = heightScale < 0.85 ? 9 : 11;
+    const axisFontSize = heightScale < 0.85 ? 9 : 11;
+    const numBars = barData.length;
+    const triggerSetting = this._config.value_label_trigger;
+    const triggerClass = triggerSetting === 'hover' ? 'show-hover' : (triggerSetting === 'tap' ? 'show-tap' : 'show-always');
+
+    const formatBound = (v) => `${this.formatNumber(v)}${boundUnit}`;
+
+    let padding, chartW, chartH, refLinesSVG = '', regionLabelsSVG = '', barsSVG = '';
+    let gradientDefs = '';
+
+    if (isHorizontal) {
+      // --- HORIZONTAL LAYOUT ---
+      // Category labels on left; bars grow left↔right; value labels at bar ends; zero line vertical
+      const catLabelSpace = 78;
+      const valueLabelSpace = showOuter ? 48 : 16;
+      const regionLabelSpace = showYLabels ? 18 : 8;
+      padding = {
+        top: regionLabelSpace + 8,
+        bottom: 12,
+        left: catLabelSpace,
+        right: valueLabelSpace,
+      };
+      chartW = svgWidth - padding.left - padding.right;
+      chartH = Math.max(24, svgHeight - padding.top - padding.bottom);
+
+      const slotH = chartH / Math.max(numBars, 1);
+      const barH = Math.min(slotH * 0.55, 36);
+      const minBarW = Math.max(2, Math.round(4 * heightScale));
+      const labelGap = Math.max(6, Math.round(8 * heightScale));
+
+      const baselineVal = crossesZero ? 0 : (min >= 0 ? min : max);
+      const baseX = padding.left + ((baselineVal - min) / range) * chartW;
+      const zeroX = padding.left + ((0 - min) / range) * chartW;
+
+      if (hasZeroLine) {
+        refLinesSVG += `<line x1="${zeroX}" y1="${padding.top}" x2="${zeroX}" y2="${padding.top + chartH}" class="zero-line" />`;
+      }
+      if (upperBound !== null && upperBound >= min && upperBound <= max) {
+        const ux = padding.left + ((upperBound - min) / range) * chartW;
+        refLinesSVG += `<line x1="${ux}" y1="${padding.top}" x2="${ux}" y2="${padding.top + chartH}" class="bound-line" style="stroke:${this._escapeHtml(upperBoundColor)}" />`;
+        if (this._config.label_upper_bound) {
+          refLinesSVG += `<text x="${ux}" y="${padding.top - 4}" text-anchor="middle" class="bound-label" style="fill:${this._escapeHtml(upperBoundColor)}">${formatBound(upperBound)}</text>`;
+        }
+      }
+      if (lowerBound !== null && lowerBound >= min && lowerBound <= max) {
+        const lx = padding.left + ((lowerBound - min) / range) * chartW;
+        refLinesSVG += `<line x1="${lx}" y1="${padding.top}" x2="${lx}" y2="${padding.top + chartH}" class="bound-line" style="stroke:${this._escapeHtml(lowerBoundColor)}" />`;
+        if (this._config.label_lower_bound) {
+          refLinesSVG += `<text x="${lx}" y="${padding.top - 4}" text-anchor="middle" class="bound-label" style="fill:${this._escapeHtml(lowerBoundColor)}">${formatBound(lowerBound)}</text>`;
+        }
+      }
+      // Warning threshold lines
+      const warnAbove = this._resolvedWarnAbove;
+      const warnBelow = this._resolvedWarnBelow;
+      const showWarnLines = this._config.show_warning_lines !== false;
+      if (showWarnLines && warnAbove !== null && Number.isFinite(warnAbove) && warnAbove >= min && warnAbove <= max) {
+        const wx = padding.left + ((warnAbove - min) / range) * chartW;
+        refLinesSVG += `<line x1="${wx}" y1="${padding.top}" x2="${wx}" y2="${padding.top + chartH}" class="warning-line" style="stroke:${this._escapeHtml(warnAboveColor)}" />`;
+        if (this._config.label_warning_lines) {
+          refLinesSVG += `<text x="${wx}" y="${padding.top - 4}" text-anchor="middle" class="warning-label" style="fill:${this._escapeHtml(warnAboveColor)}">${formatBound(warnAbove)}</text>`;
+        }
+      }
+      if (showWarnLines && warnBelow !== null && Number.isFinite(warnBelow) && warnBelow >= min && warnBelow <= max) {
+        const wx = padding.left + ((warnBelow - min) / range) * chartW;
+        refLinesSVG += `<line x1="${wx}" y1="${padding.top}" x2="${wx}" y2="${padding.top + chartH}" class="warning-line" style="stroke:${this._escapeHtml(warnBelowColor)}" />`;
+        if (this._config.label_warning_lines) {
+          refLinesSVG += `<text x="${wx}" y="${padding.top - 4}" text-anchor="middle" class="warning-label" style="fill:${this._escapeHtml(warnBelowColor)}">${formatBound(warnBelow)}</text>`;
+        }
+      }
+
+      // Region labels (Export / Import) sit above the value axis, upright
+      if (showYLabels) {
+        const aboveText = this._config.y_label_above || '';
+        const belowText = this._config.y_label_below || '';
+        const labelY = Math.max(axisFontSize + 2, padding.top - 6);
+        const yStyle = `style="fill:${this._escapeHtml(yLabelColor)}"`;
+        if (crossesZero) {
+          if (aboveText) {
+            const midPos = (zeroX + padding.left + chartW) / 2;
+            regionLabelsSVG += `<text x="${midPos}" y="${labelY}" text-anchor="middle" class="y-axis-label" ${yStyle}>${this._escapeHtml(aboveText)}</text>`;
+          }
+          if (belowText) {
+            const midNeg = (padding.left + zeroX) / 2;
+            regionLabelsSVG += `<text x="${midNeg}" y="${labelY}" text-anchor="middle" class="y-axis-label" ${yStyle}>${this._escapeHtml(belowText)}</text>`;
+          }
+        } else if (min >= 0 && aboveText) {
+          regionLabelsSVG += `<text x="${padding.left + chartW / 2}" y="${labelY}" text-anchor="middle" class="y-axis-label" ${yStyle}>${this._escapeHtml(aboveText)}</text>`;
+        } else if (max <= 0 && belowText) {
+          regionLabelsSVG += `<text x="${padding.left + chartW / 2}" y="${labelY}" text-anchor="middle" class="y-axis-label" ${yStyle}>${this._escapeHtml(belowText)}</text>`;
+        } else if (aboveText) {
+          regionLabelsSVG += `<text x="${padding.left + chartW / 2}" y="${labelY}" text-anchor="middle" class="y-axis-label" ${yStyle}>${this._escapeHtml(aboveText)}</text>`;
+        }
+      }
+
+      barsSVG = barData.map((d, i) => {
+        const centerY = padding.top + slotH * i + slotH / 2;
+        const y = centerY - barH / 2;
+        const targetX = padding.left + ((d.val - min) / range) * chartW;
+        const x = Math.min(baseX, targetX);
+        const w = Math.max(Math.abs(baseX - targetX), minBarW);
+
+        // Outer = far end of bar; inner = near baseline
+        const growsRight = targetX >= baseX;
+        let outerX = growsRight ? x + w + labelGap : x - labelGap;
+        let outerAnchor = growsRight ? 'start' : 'end';
+        let innerX = growsRight ? x - labelGap : x + w + labelGap;
+        let innerAnchor = growsRight ? 'end' : 'start';
+
+        // Clamp into viewBox
+        const minLX = 4;
+        const maxLX = svgWidth - 4;
+        outerX = Math.max(minLX, Math.min(maxLX, outerX));
+        innerX = Math.max(minLX, Math.min(maxLX, innerX));
+
+        const trendGlyph = this._getTrendGlyph(d.entityId, d.showTrend);
+        const valText = `${this.formatNumber(d.val)}${d.unit ? ' ' + d.unit : ''}${trendGlyph}`;
+        const fillInfo = this._barFill(d, i, true);
+        if (fillInfo.fill.startsWith('url(')) {
+          gradientDefs += this._gradientDef(i, fillInfo.c1, fillInfo.c2, true, fillInfo.isNeg);
+        }
+
+        const segs = this._barSegments(d.val, baselineVal, this._resolvedWarnAbove, this._resolvedWarnBelow);
+        const segRects = segs.map((seg, si) => {
+          const x1 = padding.left + ((seg.from - min) / range) * chartW;
+          const x2 = padding.left + ((seg.to - min) / range) * chartW;
+          const sx = Math.min(x1, x2);
+          const sw = Math.max(Math.abs(x2 - x1), si === 0 ? minBarW : 1);
+          const fill = seg.warn ? 'url(#warn-stripes)' : fillInfo.fill;
+          const radius = segs.length === 1 ? 'rx="4" ry="4"' : (si === 0 && !growsRight) || (si === segs.length - 1 && growsRight) ? 'rx="4" ry="4"' : '';
+          return `<rect x="${sx}" y="${y}" width="${sw}" height="${barH}" ${radius} fill="${fill}" class="bar-rect" />`;
+        }).join('');
+
+        return `
+          <g class="bar-group ${triggerClass}" tabindex="0" role="button" data-entity="${this._escapeHtml(d.entityId || '')}">
+            ${segRects}
+            ${showOuter ? `
+              <text x="${outerX}" y="${centerY}" dominant-baseline="middle" text-anchor="${outerAnchor}" class="val-label" font-size="${valFontSize}">${valText}</text>
+            ` : ''}
+            ${showInner ? `
+              <text x="${innerX}" y="${centerY}" dominant-baseline="middle" text-anchor="${innerAnchor}" class="val-label" font-size="${valFontSize}">${valText}</text>
+            ` : ''}
+            <text x="${padding.left - 8}" y="${centerY}" dominant-baseline="middle" text-anchor="end" class="axis-label" font-size="${axisFontSize}"${d.nameColor ? ` style="fill:${this._escapeHtml(d.nameColor)}"` : ''}>${this._escapeHtml(d.name)}</text>
+            <!-- Full-width hit target including left labels -->
+            <rect class="bar-hit" x="0" y="${padding.top + slotH * i}" width="${svgWidth}" height="${slotH}" />
+          </g>
+        `;
+      }).join('');
+    } else {
+      // --- VERTICAL LAYOUT (existing behaviour) ---
+      const labelGapTop = Math.max(6, Math.round(10 * heightScale));
+      const labelGapBottom = Math.max(8, Math.round(14 * heightScale));
+      const axisLabelSpace = Math.max(14, Math.round(18 * Math.min(heightScale, 1)));
+      const padTop = Math.max(
+        showOuter ? labelGapTop + 12 : 12,
+        Math.round(28 * heightScale)
+      );
+      const padBottom = Math.max(
+        axisLabelSpace + (showInner ? labelGapBottom : 0),
+        Math.round(36 * heightScale)
+      );
+      const boundLabelRight = (this._config.label_upper_bound || this._config.label_lower_bound) ? 36 : 0;
+      padding = {
+        top: padTop,
+        bottom: padBottom,
+        left: showYLabels ? 52 : 35,
+        right: 20 + boundLabelRight,
+      };
+      chartW = svgWidth - padding.left - padding.right;
+      chartH = Math.max(20, svgHeight - padding.top - padding.bottom);
+
+      const zeroY = padding.top + chartH - ((0 - min) / range) * chartH;
+      if (hasZeroLine) {
+        refLinesSVG += `<line x1="${padding.left}" y1="${zeroY}" x2="${svgWidth - padding.right}" y2="${zeroY}" class="zero-line" />`;
+      }
+      if (upperBound !== null && upperBound >= min && upperBound <= max) {
+        const uy = padding.top + chartH - ((upperBound - min) / range) * chartH;
+        refLinesSVG += `<line x1="${padding.left}" y1="${uy}" x2="${svgWidth - padding.right}" y2="${uy}" class="bound-line" style="stroke:${this._escapeHtml(upperBoundColor)}" />`;
+        if (this._config.label_upper_bound) {
+          refLinesSVG += `<text x="${svgWidth - padding.right + 4}" y="${uy}" dominant-baseline="middle" text-anchor="start" class="bound-label" style="fill:${this._escapeHtml(upperBoundColor)}">${formatBound(upperBound)}</text>`;
+        }
+      }
+      if (lowerBound !== null && lowerBound >= min && lowerBound <= max) {
+        const ly = padding.top + chartH - ((lowerBound - min) / range) * chartH;
+        refLinesSVG += `<line x1="${padding.left}" y1="${ly}" x2="${svgWidth - padding.right}" y2="${ly}" class="bound-line" style="stroke:${this._escapeHtml(lowerBoundColor)}" />`;
+        if (this._config.label_lower_bound) {
+          refLinesSVG += `<text x="${svgWidth - padding.right + 4}" y="${ly}" dominant-baseline="middle" text-anchor="start" class="bound-label" style="fill:${this._escapeHtml(lowerBoundColor)}">${formatBound(lowerBound)}</text>`;
+        }
+      }
+      // Warning threshold lines
+      const warnAboveV = this._resolvedWarnAbove;
+      const warnBelowV = this._resolvedWarnBelow;
+      const showWarnLinesV = this._config.show_warning_lines !== false;
+      if (showWarnLinesV && warnAboveV !== null && Number.isFinite(warnAboveV) && warnAboveV >= min && warnAboveV <= max) {
+        const wy = padding.top + chartH - ((warnAboveV - min) / range) * chartH;
+        refLinesSVG += `<line x1="${padding.left}" y1="${wy}" x2="${svgWidth - padding.right}" y2="${wy}" class="warning-line" style="stroke:${this._escapeHtml(warnAboveColor)}" />`;
+        if (this._config.label_warning_lines) {
+          refLinesSVG += `<text x="${svgWidth - padding.right + 4}" y="${wy}" dominant-baseline="middle" text-anchor="start" class="warning-label" style="fill:${this._escapeHtml(warnAboveColor)}">${formatBound(warnAboveV)}</text>`;
+        }
+      }
+      if (showWarnLinesV && warnBelowV !== null && Number.isFinite(warnBelowV) && warnBelowV >= min && warnBelowV <= max) {
+        const wy = padding.top + chartH - ((warnBelowV - min) / range) * chartH;
+        refLinesSVG += `<line x1="${padding.left}" y1="${wy}" x2="${svgWidth - padding.right}" y2="${wy}" class="warning-line" style="stroke:${this._escapeHtml(warnBelowColor)}" />`;
+        if (this._config.label_warning_lines) {
+          refLinesSVG += `<text x="${svgWidth - padding.right + 4}" y="${wy}" dominant-baseline="middle" text-anchor="start" class="warning-label" style="fill:${this._escapeHtml(warnBelowColor)}">${formatBound(warnBelowV)}</text>`;
+        }
+      }
+
+      const slotW = chartW / Math.max(numBars, 1);
+      const barW = Math.min(slotW * 0.55, 45);
+      const minBarH = Math.max(2, Math.round(4 * heightScale));
+      const topLabelMinY = valFontSize + 2;
+      const bottomLabelMaxY = svgHeight - axisLabelSpace - 2;
+
+      const baselineVal = crossesZero ? 0 : (min >= 0 ? min : max);
+      const baseY = padding.top + chartH - ((baselineVal - min) / range) * chartH;
+
+      barsSVG = barData.map((d, i) => {
+        const centerX = padding.left + slotW * i + slotW / 2;
+        const x = centerX - barW / 2;
+        const targetY = padding.top + chartH - ((d.val - min) / range) * chartH;
+        const y = Math.min(baseY, targetY);
+        const h = Math.max(Math.abs(baseY - targetY), minBarH);
+
+        let outerLabelY = y - labelGapTop;
+        if (outerLabelY < topLabelMinY) outerLabelY = topLabelMinY;
+
+        let innerLabelY = y + h + labelGapBottom;
+        if (innerLabelY > bottomLabelMaxY) innerLabelY = bottomLabelMaxY;
+        if (showInner && innerLabelY < y + h + 4) {
+          innerLabelY = Math.min(y + h + Math.max(4, labelGapBottom * 0.6), bottomLabelMaxY);
+        }
+
+        const trendGlyph = this._getTrendGlyph(d.entityId, d.showTrend);
+        const valText = `${this.formatNumber(d.val)}${d.unit ? ' ' + d.unit : ''}${trendGlyph}`;
+        const fillInfo = this._barFill(d, i, false);
+        if (fillInfo.fill.startsWith('url(')) {
+          gradientDefs += this._gradientDef(i, fillInfo.c1, fillInfo.c2, false, fillInfo.isNeg);
+        }
+
+        const growsUp = targetY <= baseY;
+        const segs = this._barSegments(d.val, baselineVal, this._resolvedWarnAbove, this._resolvedWarnBelow);
+        const segRects = segs.map((seg, si) => {
+          const y1 = padding.top + chartH - ((seg.from - min) / range) * chartH;
+          const y2 = padding.top + chartH - ((seg.to - min) / range) * chartH;
+          const sy = Math.min(y1, y2);
+          const sh = Math.max(Math.abs(y2 - y1), si === 0 ? minBarH : 1);
+          const fill = seg.warn ? 'url(#warn-stripes)' : fillInfo.fill;
+          // Round the outer tip corners only
+          const isTip = (growsUp && seg.to === Math.max(seg.from, seg.to) && d.val >= baselineVal && si === segs.length - 1)
+            || (growsUp && d.val < baselineVal && si === 0)
+            || (!growsUp && si === segs.length - 1);
+          const radius = segs.length === 1 ? 'rx="4" ry="4"' : (isTip ? 'rx="4" ry="4"' : '');
+          return `<rect x="${x}" y="${sy}" width="${barW}" height="${sh}" ${radius} fill="${fill}" class="bar-rect" />`;
+        }).join('');
+
+        return `
+          <g class="bar-group ${triggerClass}" tabindex="0" role="button" data-entity="${this._escapeHtml(d.entityId || '')}">
+            ${segRects}
+            ${showOuter ? `
+              <text x="${centerX}" y="${outerLabelY}" text-anchor="middle" class="val-label" font-size="${valFontSize}">${valText}</text>
+            ` : ''}
+            ${showInner ? `
+              <text x="${centerX}" y="${innerLabelY}" text-anchor="middle" class="val-label" font-size="${valFontSize}">${valText}</text>
+            ` : ''}
+            <text x="${centerX}" y="${svgHeight - Math.max(4, Math.round(6 * heightScale))}" text-anchor="middle" class="axis-label" font-size="${axisFontSize}"${d.nameColor ? ` style="fill:${this._escapeHtml(d.nameColor)}"` : ''}>
+              ${this._escapeHtml(d.name)}
+            </text>
+            <!-- Full-column hit target including bottom labels -->
+            <rect class="bar-hit" x="${padding.left + slotW * i}" y="0" width="${slotW}" height="${svgHeight}" />
+          </g>
+        `;
+      }).join('');
+
+      // Left-side region labels (rotated)
+      if (showYLabels) {
+        const labelX = 14;
+        const aboveText = this._config.y_label_above || '';
+        const belowText = this._config.y_label_below || '';
+        const yStyle = `style="fill:${this._escapeHtml(yLabelColor)}"`;
+        if (crossesZero) {
+          if (aboveText) {
+            const midAbove = (padding.top + zeroY) / 2;
+            regionLabelsSVG += `
+              <text x="${labelX}" y="${midAbove}" text-anchor="middle" class="y-axis-label" ${yStyle}
+                transform="rotate(-90, ${labelX}, ${midAbove})">${this._escapeHtml(aboveText)}</text>`;
+          }
+          if (belowText) {
+            const midBelow = (zeroY + padding.top + chartH) / 2;
+            regionLabelsSVG += `
+              <text x="${labelX}" y="${midBelow}" text-anchor="middle" class="y-axis-label" ${yStyle}
+                transform="rotate(-90, ${labelX}, ${midBelow})">${this._escapeHtml(belowText)}</text>`;
+          }
+        } else if (min >= 0 && aboveText) {
+          const mid = padding.top + chartH / 2;
+          regionLabelsSVG += `
+            <text x="${labelX}" y="${mid}" text-anchor="middle" class="y-axis-label" ${yStyle}
+              transform="rotate(-90, ${labelX}, ${mid})">${this._escapeHtml(aboveText)}</text>`;
+        } else if (max <= 0 && belowText) {
+          const mid = padding.top + chartH / 2;
+          regionLabelsSVG += `
+            <text x="${labelX}" y="${mid}" text-anchor="middle" class="y-axis-label" ${yStyle}
+              transform="rotate(-90, ${labelX}, ${mid})">${this._escapeHtml(belowText)}</text>`;
+        } else if (aboveText) {
+          const mid = padding.top + chartH / 2;
+          regionLabelsSVG += `
+            <text x="${labelX}" y="${mid}" text-anchor="middle" class="y-axis-label" ${yStyle}
+              transform="rotate(-90, ${labelX}, ${mid})">${this._escapeHtml(aboveText)}</text>`;
+        }
+      }
+    }
+
+    this.shadowRoot.innerHTML = `
+      <style>
+        :host {
+          display: block;
+        }
+        ha-card {
+          position: relative;
+          overflow: hidden;
+          padding: 16px;
+          border-radius: var(--ha-card-border-radius, 12px);
+          color: var(--primary-text-color, #fff);
+          ${bgStyle}
+        }
+        .bg-overlay {
+          position: absolute;
+          inset: 0;
+          background: rgba(0, 0, 0, ${this._config.bg_opacity ?? 0.2});
+          pointer-events: none;
+          z-index: 1;
+        }
+        .content {
+          position: relative;
+          z-index: 2;
+        }
+        .card-header {
+          display: flex;
+          flex-direction: column;
+          align-items: flex-start;
+          gap: 6px;
+          margin-bottom: 12px;
+        }
+        .card-title {
+          font-size: 1.1rem;
+          font-weight: 600;
+          color: var(--primary-text-color, #ffffff);
+          line-height: 1.3;
+        }
+        .card-icon {
+          --mdc-icon-size: 28px;
+          color: var(--primary-text-color, #ffffff);
+          opacity: 0.9;
+        }
+        svg {
+          width: 100%;
+          height: auto;
+          overflow: visible;
+        }
+        .zero-line, .bound-line, .warning-line {
+          stroke: rgba(255, 255, 255, 0.35);
+          stroke-dasharray: 4,4;
+          stroke-width: 1.5;
+        }
+        .bound-label, .warning-label {
+          fill: var(--secondary-text-color, #9ca3af);
+          font-size: ${axisFontSize}px;
+          font-weight: 600;
+        }
+        .axis-label {
+          fill: var(--secondary-text-color, #9ca3af);
+          font-size: ${axisFontSize}px;
+          font-weight: 500;
+        }
+        .y-axis-label {
+          fill: var(--secondary-text-color, #9ca3af);
+          font-size: ${axisFontSize}px;
+          font-weight: 600;
+          letter-spacing: 0.5px;
+        }
+        .val-label {
+          fill: var(--primary-text-color, #ffffff);
+          font-size: ${valFontSize}px;
+          font-weight: 700;
+          transition: opacity 0.2s ease-in-out;
+        }
+        .bar-rect {
+          pointer-events: none;
+          transition: height 0.4s ease, width 0.4s ease, y 0.4s ease, x 0.4s ease;
+        }
+        .val-label, .axis-label {
+          pointer-events: none;
+        }
+        /* Transparent hit layer on top of bar + labels — receives all clicks */
+        .bar-hit {
+          fill: transparent;
+          cursor: pointer;
+          pointer-events: all;
+        }
+        .bar-group:hover .bar-hit, .bar-group:focus .bar-hit {
+          fill: rgba(255, 255, 255, 0.06);
+        }
+
+        /* Label Triggers */
+        .show-always .val-label { opacity: 1; }
+        
+        .show-hover .val-label { opacity: 0; }
+        .show-hover:hover .val-label { opacity: 1; }
+
+        .show-tap .val-label { opacity: 0; }
+        .show-tap:focus .val-label, .show-tap:active .val-label { opacity: 1; }
+      </style>
+
+      <ha-card>
+        ${this._config.background_type === 'image' ? '<div class="bg-overlay"></div>' : ''}
+        <div class="content">
+          ${(this._config.title || this._config.icon) ? `
+            <div class="card-header">
+              ${this._config.title ? `<div class="card-title">${this._escapeHtml(this._config.title)}</div>` : ''}
+              ${this._config.icon ? `<ha-icon class="card-icon" icon="${this._escapeHtml(this._config.icon)}"></ha-icon>` : ''}
+            </div>
+          ` : ''}
+          <svg viewBox="0 0 ${svgWidth} ${svgHeight}">
+            <defs>
+              <pattern id="warn-stripes" patternUnits="userSpaceOnUse" width="10" height="10" patternTransform="rotate(45)">
+                <rect width="10" height="10" fill="#EAB308"/>
+                <rect width="5" height="10" fill="#1a1a1a"/>
+              </pattern>
+              ${gradientDefs}
+            </defs>
+            ${refLinesSVG}
+            ${regionLabelsSVG}
+            ${barsSVG}
+          </svg>
+        </div>
+      </ha-card>
+    `;
+
+    this._scheduleTrendHide();
+  }
+
+  _onBarActivate(ev) {
+    // Walk up from target (works for SVG nodes) to find data-entity
+    let el = ev.target;
+    while (el && el !== this.shadowRoot) {
+      if (el.getAttribute) {
+        const entityId = el.getAttribute('data-entity');
+        if (entityId) {
+          ev.preventDefault();
+          ev.stopPropagation();
+          this._openMoreInfo(entityId);
+          return;
+        }
+      }
+      el = el.parentElement || el.parentNode;
+    }
+  }
+
+  _openMoreInfo(entityId) {
+    if (!entityId) return;
+    const event = new CustomEvent('hass-more-info', {
+      detail: { entityId },
+      bubbles: true,
+      composed: true,
+    });
+    this.dispatchEvent(event);
+  }
+
+  _escapeHtml(str) {
+    return String(str)
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;');
+  }
+}
+
+class OneToFourBarChartEditor extends HTMLElement {
+  constructor() {
+    super();
+    this.attachShadow({ mode: 'open' });
+    this._config = {};
+    this._hass = null;
+    this._rendered = false;
+    this._lastStructureKey = null;
+    this._helpersLoaded = false;
+  }
+
+  set hass(hass) {
+    this._hass = hass;
+    // Only re-render if structure changed or first time; otherwise just update pickers
+    if (this._rendered) {
+      this._updateEntityPickers();
+    } else {
+      this.render();
+    }
+  }
+
+  setConfig(config) {
+    const prevEntitiesLen = (this._config.entities || []).length;
+    const newEntitiesLen = (config.entities || []).length;
+    const structureKey = this._getStructureKey(config);
+
+    this._config = config;
+
+    // Full re-render only when the form structure itself changes
+    if (
+      !this._rendered ||
+      structureKey !== this._lastStructureKey ||
+      prevEntitiesLen !== newEntitiesLen
+    ) {
+      this._lastStructureKey = structureKey;
+      this.render();
+    } else {
+      // Structure same → just sync values into existing inputs (keeps focus)
+      this._syncValues();
+    }
+  }
+
+  _getStructureKey(config) {
+    return [
+      config.scale_mode || 'auto',
+      config.background_type || 'solid',
+      config.orientation || 'vertical',
+      !!config.show_y_labels,
+      (config.entities || []).length,
+    ].join('|');
+  }
+
+  configChanged(newConfig) {
+    const event = new CustomEvent('config-changed', {
+      detail: { config: newConfig },
+      bubbles: true,
+      composed: true,
+    });
+    this.dispatchEvent(event);
+  }
+
+  async _ensureHelpers() {
+    if (this._helpersLoaded) return;
+    // Force-load HA editor components (entity + icon pickers)
+    try {
+      if (!customElements.get('ha-entity-picker') || !customElements.get('ha-icon-picker')) {
+        const entitiesCard = customElements.get('hui-entities-card');
+        if (entitiesCard && entitiesCard.getConfigElement) {
+          await entitiesCard.getConfigElement();
+        }
+        // Button / entity card editors also pull in ha-icon-picker
+        const buttonCard = customElements.get('hui-button-card');
+        if (buttonCard && buttonCard.getConfigElement) {
+          await buttonCard.getConfigElement();
+        }
+      }
+      await Promise.all([
+        customElements.whenDefined('ha-entity-picker').catch(() => {}),
+        customElements.whenDefined('ha-icon-picker').catch(() => {}),
+      ]);
+    } catch (e) {
+      console.warn('Could not pre-load HA pickers', e);
+    }
+    this._helpersLoaded = true;
+  }
+
+  _handleFieldChange(ev) {
+    if (!this._config) return;
+    const target = ev.target;
+    const field = target.dataset.field;
+    const index = target.dataset.index;
+
+    // HA pickers expose .value; native inputs use target.value / checked
+    let value;
+    if (target.tagName === 'HA-ENTITY-PICKER' || target.tagName === 'HA-ICON-PICKER') {
+      value = target.value;
+    } else if (target.type === 'checkbox') {
+      value = target.checked;
+    } else if (target.type === 'number') {
+      value = target.value === '' ? null : Number(target.value);
+    } else {
+      value = target.value;
+    }
+
+    // Min/Max/warn: empty → null; keep strings for entity_id / Jinja
+    if (['min_value', 'max_value', 'warn_above', 'warn_below'].includes(field) && (value === '' || value === null || value === undefined)) {
+      value = null;
+    }
+
+    const updatedConfig = JSON.parse(JSON.stringify(this._config));
+
+    // Master trend override: set show_trend on every entity
+    if (field === 'show_trend_all' && index === undefined) {
+      updatedConfig.show_trend_all = value;
+      updatedConfig.entities = (updatedConfig.entities || []).map((ent) => ({
+        ...ent,
+        show_trend: !!value,
+      }));
+      this.configChanged(updatedConfig);
+      return;
+    }
+
+    if (index !== undefined) {
+      const idx = parseInt(index, 10);
+      updatedConfig.entities = updatedConfig.entities || [];
+      if (!updatedConfig.entities[idx]) updatedConfig.entities[idx] = {};
+      updatedConfig.entities[idx][field] = value;
+      // Keep master checkbox in sync when individual bars change
+      if (field === 'show_trend') {
+        const allOn = (updatedConfig.entities || []).length > 0 &&
+          (updatedConfig.entities || []).every((ent) => !!ent.show_trend);
+        updatedConfig.show_trend_all = allOn;
+      }
+    } else {
+      updatedConfig[field] = value;
+    }
+
+    this.configChanged(updatedConfig);
+  }
+
+  _addEntity() {
+    const updatedConfig = JSON.parse(JSON.stringify(this._config));
+    updatedConfig.entities = updatedConfig.entities || [];
+    if (updatedConfig.entities.length < 4) {
+      updatedConfig.entities.push({
+        entity: '',
+        name: `Bar ${updatedConfig.entities.length + 1}`,
+        color: ['#3B82F6', '#10B981', '#F59E0B', '#EF4444'][updatedConfig.entities.length],
+        color_negative: '',
+        color_mode: 'solid',
+        color_end: '',
+        color_end_negative: '',
+        name_color: '',
+        unit: '',
+        factor: 1,
+        show_trend: !!updatedConfig.show_trend_all,
+      });
+      this.configChanged(updatedConfig);
+    }
+  }
+
+  _removeEntity(ev) {
+    const idx = parseInt(ev.currentTarget.dataset.index, 10);
+    const updatedConfig = JSON.parse(JSON.stringify(this._config));
+    updatedConfig.entities.splice(idx, 1);
+    this.configChanged(updatedConfig);
+  }
+
+  /** Sync current config values into already-rendered inputs without destroying focus */
+  _syncValues() {
+    if (!this.shadowRoot) return;
+    const cfg = this._config;
+
+    // Title
+    const titleInput = this.shadowRoot.querySelector('[data-field="title"]');
+    if (titleInput && titleInput.value !== (cfg.title || '')) {
+      titleInput.value = cfg.title || '';
+    }
+
+    // Icon picker
+    const iconPicker = this.shadowRoot.querySelector('ha-icon-picker[data-field="icon"]');
+    if (iconPicker && iconPicker.value !== (cfg.icon || '')) {
+      iconPicker.value = cfg.icon || '';
+    }
+
+    // Root selects / checkboxes / numbers (and text fallback for icon)
+    this.shadowRoot.querySelectorAll('[data-field]:not([data-index])').forEach((el) => {
+      const field = el.dataset.field;
+      if (field === 'title') return;
+      if (field === 'icon' && el.tagName === 'HA-ICON-PICKER') return;
+      const val = cfg[field];
+      if (el.type === 'checkbox') {
+        el.checked = !!val;
+      } else if (el.tagName === 'SELECT' || el.type === 'text' || el.type === 'number' || el.type === 'color') {
+        if (String(el.value) !== String(val ?? '')) {
+          el.value = val ?? '';
+        }
+      }
+    });
+
+    // Entity-related fields
+    (cfg.entities || []).forEach((item, idx) => {
+      const entityPicker = this.shadowRoot.querySelector(`ha-entity-picker[data-index="${idx}"]`);
+      if (entityPicker && entityPicker.value !== (item.entity || '')) {
+        entityPicker.value = item.entity || '';
+      }
+      ['name', 'color', 'color_negative', 'color_mode', 'color_end', 'color_end_negative', 'name_color', 'unit', 'factor', 'show_trend'].forEach((f) => {
+        const input = this.shadowRoot.querySelector(`[data-field="${f}"][data-index="${idx}"]`);
+        if (input) {
+          if (f === 'show_trend') {
+            input.checked = !!item.show_trend;
+            return;
+          }
+          let expected;
+          if (f === 'factor') expected = item[f] ?? 1;
+          else if (f === 'name_color') expected = item[f] || '#9ca3af';
+          else if (f === 'color_mode') expected = item[f] || 'solid';
+          else if (f === 'color_negative' || f === 'color_end' || f === 'color_end_negative') expected = item[f] || '#888888';
+          else expected = item[f] ?? '';
+          if (String(input.value) !== String(expected)) {
+            input.value = expected;
+          }
+        }
+      });
+    });
+  }
+
+  _updateEntityPickers() {
+    if (!this._hass || !this.shadowRoot) return;
+    this.shadowRoot.querySelectorAll('ha-entity-picker').forEach((picker) => {
+      picker.hass = this._hass;
+    });
+  }
+
+  async render() {
+    if (!this.shadowRoot) return;
+    await this._ensureHelpers();
+
+    const entities = this._config.entities || [];
+    const hasEntityPicker = !!customElements.get('ha-entity-picker');
+    const hasIconPicker = !!customElements.get('ha-icon-picker');
+
+    this.shadowRoot.innerHTML = `
+      <style>
+        .form {
+          display: flex;
+          flex-direction: column;
+          gap: 14px;
+          padding: 8px;
+          font-family: var(--paper-font-body1_-_font-family, sans-serif);
+          color: var(--primary-text-color, #fff);
+        }
+        .section-title {
+          font-weight: 600;
+          font-size: 14px;
+          border-bottom: 1px solid var(--divider-color, #374151);
+          padding-bottom: 4px;
+          margin-top: 8px;
+        }
+        .row {
+          display: flex;
+          gap: 10px;
+          align-items: center;
+        }
+        .field {
+          display: flex;
+          flex-direction: column;
+          gap: 4px;
+          flex: 1;
+        }
+        label {
+          font-size: 12px;
+          color: var(--secondary-text-color, #9ca3af);
+        }
+        input, select {
+          padding: 8px;
+          border-radius: 6px;
+          border: 1px solid var(--divider-color, #4b5563);
+          background: var(--card-background-color, #1f2937);
+          color: var(--primary-text-color, #fff);
+          font-size: 13px;
+          box-sizing: border-box;
+          width: 100%;
+        }
+        input[type="color"] {
+          padding: 2px;
+          height: 36px;
+        }
+        button {
+          cursor: pointer;
+          padding: 8px 12px;
+          border-radius: 6px;
+          border: none;
+          background: var(--primary-color, #2563eb);
+          color: white;
+          font-weight: 600;
+        }
+        .btn-danger {
+          background: #ef4444;
+          padding: 4px 8px;
+          font-size: 12px;
+        }
+        .entity-box {
+          border: 1px dashed var(--divider-color, #4b5563);
+          padding: 10px;
+          border-radius: 8px;
+          display: flex;
+          flex-direction: column;
+          gap: 8px;
+        }
+        ha-entity-picker,
+        ha-icon-picker {
+          display: block;
+          width: 100%;
+        }
+      </style>
+
+      <div class="form">
+        <!-- Title -->
+        <div class="field">
+          <label>Card Title</label>
+          <input type="text" data-field="title" value="${this._escape(this._config.title || '')}" />
+        </div>
+
+        <!-- Icon -->
+        <div class="field">
+          <label>Card Icon</label>
+          ${hasIconPicker
+            ? `<ha-icon-picker data-field="icon" label="" placeholder="mdi:chart-bar"></ha-icon-picker>`
+            : `<input type="text" data-field="icon" value="${this._escape(this._config.icon || '')}" placeholder="mdi:chart-bar" />`
+          }
+        </div>
+
+        <!-- Entities Section -->
+        <div class="section-title">Entities (Up to 4)</div>
+        ${entities.map((item, idx) => `
+          <div class="entity-box">
+            <div class="row" style="justify-content: space-between;">
+              <strong>Bar #${idx + 1}</strong>
+              <button type="button" class="btn-danger" data-index="${idx}">Remove</button>
+            </div>
+            <div class="field">
+              <label>Entity</label>
+              ${hasEntityPicker
+                ? `<ha-entity-picker
+                      data-field="entity"
+                      data-index="${idx}"
+                      allow-custom-entity
+                    ></ha-entity-picker>`
+                : `<input type="text" data-field="entity" data-index="${idx}"
+                      value="${this._escape(item.entity || '')}"
+                      placeholder="sensor.my_sensor" />`
+              }
+            </div>
+            <div class="row">
+              <div class="field">
+                <label>Label</label>
+                <input type="text" data-field="name" data-index="${idx}" value="${this._escape(item.name || '')}" />
+              </div>
+              <div class="field">
+                <label>Label color</label>
+                <input type="color" data-field="name_color" data-index="${idx}" value="${item.name_color || '#9ca3af'}" title="Series name colour" />
+              </div>
+              <div class="field">
+                <label>Custom Unit</label>
+                <input type="text" data-field="unit" data-index="${idx}" value="${this._escape(item.unit || '')}" placeholder="Auto" />
+              </div>
+              <div class="field">
+                <label>Factor</label>
+                <input type="number" step="any" data-field="factor" data-index="${idx}" value="${item.factor ?? 1}" title="e.g. 0.001 for W→kW" />
+              </div>
+            </div>
+            <div class="row">
+              <label class="row" style="cursor: pointer;">
+                <input type="checkbox" data-field="show_trend" data-index="${idx}" ${item.show_trend ? 'checked' : ''} />
+                Show trend ▲/▼ (vs previous value)
+              </label>
+            </div>
+            <div class="row">
+              <div class="field">
+                <label>Fill mode</label>
+                <select data-field="color_mode" data-index="${idx}">
+                  <option value="solid" ${(item.color_mode || 'solid') === 'solid' ? 'selected' : ''}>Solid</option>
+                  <option value="gradient" ${item.color_mode === 'gradient' ? 'selected' : ''}>Gradient</option>
+                </select>
+              </div>
+              <div class="field">
+                <label>Bar +</label>
+                <input type="color" data-field="color" data-index="${idx}" value="${item.color || '#3B82F6'}" title="Positive value colour" />
+              </div>
+              <div class="field">
+                <label>Bar −</label>
+                <input type="color" data-field="color_negative" data-index="${idx}" value="${item.color_negative || '#EF4444'}" title="Negative value colour (optional)" />
+              </div>
+              <div class="field">
+                <label>Grad end +</label>
+                <input type="color" data-field="color_end" data-index="${idx}" value="${item.color_end || item.color || '#93C5FD'}" title="Gradient end (positive)" />
+              </div>
+              <div class="field">
+                <label>Grad end −</label>
+                <input type="color" data-field="color_end_negative" data-index="${idx}" value="${item.color_end_negative || item.color_negative || '#FCA5A5'}" title="Gradient end (negative)" />
+              </div>
+            </div>
+          </div>
+        `).join('')}
+
+        ${entities.length < 4 ? `<button type="button" id="add-btn">+ Add Entity</button>` : ''}
+
+        <!-- Display Options -->
+        <div class="section-title">Label & Scale Options</div>
+        <div class="row">
+          <div class="field">
+            <label>Orientation</label>
+            <select data-field="orientation">
+              <option value="vertical" ${(this._config.orientation || 'vertical') === 'vertical' ? 'selected' : ''}>Vertical bars</option>
+              <option value="horizontal" ${this._config.orientation === 'horizontal' ? 'selected' : ''}>Horizontal bars</option>
+            </select>
+          </div>
+          <div class="field">
+            <label>Value Label Position</label>
+            <select data-field="value_label_position">
+              <option value="top" ${this._config.value_label_position === 'top' ? 'selected' : ''}>Outer end (top / far)</option>
+              <option value="bottom" ${this._config.value_label_position === 'bottom' ? 'selected' : ''}>Near baseline</option>
+              <option value="both" ${this._config.value_label_position === 'both' ? 'selected' : ''}>Both</option>
+              <option value="none" ${this._config.value_label_position === 'none' ? 'selected' : ''}>None</option>
+            </select>
+          </div>
+        </div>
+        <div class="row">
+          <div class="field">
+            <label>Trigger</label>
+            <select data-field="value_label_trigger">
+              <option value="always" ${this._config.value_label_trigger === 'always' ? 'selected' : ''}>Always</option>
+              <option value="hover" ${this._config.value_label_trigger === 'hover' ? 'selected' : ''}>Hover</option>
+              <option value="tap" ${this._config.value_label_trigger === 'tap' ? 'selected' : ''}>Tap</option>
+            </select>
+          </div>
+        </div>
+        <div class="row">
+          <label class="row" style="cursor: pointer;">
+            <input type="checkbox" data-field="show_trend_all" ${(entities.length > 0 && entities.every((e) => !!e.show_trend)) ? 'checked' : ''} />
+            Show trend on all bars (sets each bar’s trend checkbox)
+          </label>
+        </div>
+        <div style="font-size:11px;color:var(--secondary-text-color,#9ca3af);margin-top:-6px;">
+          Trend ▲/▼ uses the previous entity state, matches the value label colour, and hides after 5 minutes with no change.
+        </div>
+
+        <div class="row">
+          <div class="field">
+            <label>Scale Mode</label>
+            <select data-field="scale_mode">
+              <option value="auto" ${this._config.scale_mode === 'auto' ? 'selected' : ''}>Auto Current</option>
+              <option value="fixed" ${this._config.scale_mode === 'fixed' ? 'selected' : ''}>Fixed Bounds</option>
+              <option value="history_24h" ${this._config.scale_mode === 'history_24h' ? 'selected' : ''}>24h History Scale</option>
+            </select>
+          </div>
+          <div class="field">
+            <label>${this._config.scale_mode === 'fixed' ? 'Min (scale)' : 'Min (optional bound)'}</label>
+            <input type="text" data-field="min_value" value="${this._escape(this._config.min_value ?? '')}" placeholder="0 | sensor.x | {{ ... }}" />
+          </div>
+          <div class="field">
+            <label>${this._config.scale_mode === 'fixed' ? 'Max (scale)' : 'Max (optional bound)'}</label>
+            <input type="text" data-field="max_value" value="${this._escape(this._config.max_value ?? '')}" placeholder="100 | sensor.x | {{ ... }}" />
+          </div>
+        </div>
+        <div style="font-size:11px;color:var(--secondary-text-color,#9ca3af);margin-top:-6px;">
+          Min/Max accept a number, an entity_id, or a Jinja template (e.g. &#123;&#123; states('sensor.cap') | float &#125;&#125;).
+        </div>
+
+        <div class="row">
+          <label class="row" style="cursor: pointer;">
+            <input type="checkbox" data-field="show_zero_line" ${this._config.show_zero_line ? 'checked' : ''} />
+            Show Zero Line (if min &lt; 0 &lt; max)
+          </label>
+        </div>
+
+        <div class="section-title">Reference lines</div>
+        <div class="row">
+          <label class="row" style="cursor: pointer;">
+            <input type="checkbox" data-field="show_upper_bound" ${this._config.show_upper_bound ? 'checked' : ''} />
+            Show upper bound line
+          </label>
+          <label class="row" style="cursor: pointer;">
+            <input type="checkbox" data-field="label_upper_bound" ${this._config.label_upper_bound ? 'checked' : ''} />
+            Label upper value
+          </label>
+          <div class="field" style="flex: 0 0 70px;">
+            <label>Colour</label>
+            <input type="color" data-field="upper_bound_color" value="${this._config.upper_bound_color || '#ffffff'}" title="Upper bound line & label colour" />
+          </div>
+        </div>
+        <div class="row">
+          <label class="row" style="cursor: pointer;">
+            <input type="checkbox" data-field="show_lower_bound" ${this._config.show_lower_bound ? 'checked' : ''} />
+            Show lower bound line
+          </label>
+          <label class="row" style="cursor: pointer;">
+            <input type="checkbox" data-field="label_lower_bound" ${this._config.label_lower_bound ? 'checked' : ''} />
+            Label lower value
+          </label>
+          <div class="field" style="flex: 0 0 70px;">
+            <label>Colour</label>
+            <input type="color" data-field="lower_bound_color" value="${this._config.lower_bound_color || '#ffffff'}" title="Lower bound line & label colour" />
+          </div>
+        </div>
+        <div style="font-size:11px;color:var(--secondary-text-color,#9ca3af);margin-top:-6px;">
+          Fixed: lines use Min/Max. Auto/24h: use Max/Min if set, otherwise the computed scale edge (e.g. 24h peak).
+        </div>
+
+        <div class="section-title">Warning thresholds</div>
+        <div class="row">
+          <div class="field">
+            <label>Warn if below</label>
+            <input type="text" data-field="warn_below" value="${this._escape(this._config.warn_below ?? '')}" placeholder="e.g. 208" />
+          </div>
+          <div class="field">
+            <label>Warn if above</label>
+            <input type="text" data-field="warn_above" value="${this._escape(this._config.warn_above ?? '')}" placeholder="e.g. 253" />
+          </div>
+        </div>
+        <div class="row">
+          <label class="row" style="cursor: pointer;">
+            <input type="checkbox" data-field="show_warning_lines" ${this._config.show_warning_lines !== false ? 'checked' : ''} />
+            Show warning lines
+          </label>
+          <label class="row" style="cursor: pointer;">
+            <input type="checkbox" data-field="label_warning_lines" ${this._config.label_warning_lines ? 'checked' : ''} />
+            Label warning values
+          </label>
+        </div>
+        <div class="row">
+          <div class="field" style="flex: 0 0 90px;">
+            <label>Above colour</label>
+            <input type="color" data-field="warn_above_color" value="${this._config.warn_above_color || '#EAB308'}" title="Upper warning line & label colour" />
+          </div>
+          <div class="field" style="flex: 0 0 90px;">
+            <label>Below colour</label>
+            <input type="color" data-field="warn_below_color" value="${this._config.warn_below_color || '#EAB308'}" title="Lower warning line & label colour" />
+          </div>
+        </div>
+        <div style="font-size:11px;color:var(--secondary-text-color,#9ca3af);margin-top:-6px;">
+          Number, entity_id, or Jinja. Out-of-spec portion of each bar uses hazard stripes.
+        </div>
+
+        <div class="row">
+          <label class="row" style="cursor: pointer;">
+            <input type="checkbox" data-field="show_y_labels" ${this._config.show_y_labels ? 'checked' : ''} />
+            Show Y-axis labels (left side)
+          </label>
+          <div class="field" style="flex: 0 0 70px;">
+            <label>Colour</label>
+            <input type="color" data-field="y_label_color" value="${this._config.y_label_color || '#9ca3af'}" title="Y-axis label colour" />
+          </div>
+        </div>
+        ${this._config.show_y_labels ? `
+          <div class="row">
+            <div class="field">
+              <label>Label above zero</label>
+              <input type="text" data-field="y_label_above" value="${this._escape(this._config.y_label_above || '')}" placeholder="e.g. Export" />
+            </div>
+            <div class="field">
+              <label>Label below zero</label>
+              <input type="text" data-field="y_label_below" value="${this._escape(this._config.y_label_below || '')}" placeholder="e.g. Import" />
+            </div>
+          </div>
+        ` : ''}
+
+        <div class="row">
+          <div class="field">
+            <label>Height scale (1 = default)</label>
+            <input type="number" step="0.1" min="0.5" max="3" data-field="height_scale" value="${this._config.height_scale ?? 1}" title="1 = normal, 1.5 = 50% taller, 0.75 = more compact" />
+          </div>
+          <div class="field">
+            <label>Decimals</label>
+            <input type="number" step="1" min="0" max="6" data-field="decimals" value="${this._config.decimals ?? 1}" title="Decimal places for value and bound labels" />
+          </div>
+        </div>
+
+        <!-- Background Options -->
+        <div class="section-title">Background Styling</div>
+        <div class="field">
+          <label>Background Type</label>
+          <select data-field="background_type">
+            <option value="solid" ${this._config.background_type === 'solid' ? 'selected' : ''}>Solid Color</option>
+            <option value="gradient" ${this._config.background_type === 'gradient' ? 'selected' : ''}>Gradient</option>
+            <option value="image" ${this._config.background_type === 'image' ? 'selected' : ''}>Image</option>
+          </select>
+        </div>
+
+        ${this._config.background_type === 'solid' ? `
+          <div class="row">
+            <div class="field">
+              <label>Background Color</label>
+              <input type="color" data-field="bg_color" value="${(this._config.bg_color || '#1c1c1e').startsWith('#') ? this._config.bg_color : '#1c1c1e'}" />
+            </div>
+            <div class="field">
+              <label>Or CSS value / variable</label>
+              <input type="text" data-field="bg_color" value="${this._escape(this._config.bg_color || 'var(--ha-card-background, #1c1c1e)')}" placeholder="var(--ha-card-background) or #1c1c1e" />
+            </div>
+          </div>
+        ` : ''}
+
+        ${this._config.background_type === 'gradient' ? `
+          <div class="row">
+            <div class="field">
+              <label>Gradient Start</label>
+              <input type="color" data-field="bg_gradient_start" value="${this._config.bg_gradient_start || '#1f2937'}" />
+            </div>
+            <div class="field">
+              <label>Gradient End</label>
+              <input type="color" data-field="bg_gradient_end" value="${this._config.bg_gradient_end || '#111827'}" />
+            </div>
+          </div>
+        ` : ''}
+
+        ${this._config.background_type === 'image' ? `
+          <div class="field">
+            <label>Image URL</label>
+            <input type="text" data-field="bg_image_url" value="${this._escape(this._config.bg_image_url || '')}" />
+          </div>
+          <div class="row">
+            <div class="field">
+              <label>Fit</label>
+              <select data-field="bg_image_fit">
+                <option value="cover" ${this._config.bg_image_fit === 'cover' ? 'selected' : ''}>Cover</option>
+                <option value="contain" ${this._config.bg_image_fit === 'contain' ? 'selected' : ''}>Contain</option>
+                <option value="fill" ${this._config.bg_image_fit === 'fill' ? 'selected' : ''}>Fill</option>
+                <option value="center" ${this._config.bg_image_fit === 'center' ? 'selected' : ''}>Center</option>
+              </select>
+            </div>
+            <div class="field">
+              <label>Overlay Opacity</label>
+              <input type="number" step="0.1" min="0" max="1" data-field="bg_opacity" value="${this._config.bg_opacity ?? 0.2}" />
+            </div>
+          </div>
+        ` : ''}
+      </div>
+    `;
+
+    // Attach event listeners (only after full render)
+    this.shadowRoot.querySelectorAll('input, select').forEach((input) => {
+      // Use 'change' so we only push config on blur / selection change → keeps focus while typing
+      input.addEventListener('change', (e) => this._handleFieldChange(e));
+    });
+
+    // Entity pickers need special handling
+    this.shadowRoot.querySelectorAll('ha-entity-picker').forEach((picker) => {
+      picker.hass = this._hass;
+      const idx = picker.dataset.index;
+      const item = entities[idx];
+      if (item) picker.value = item.entity || '';
+      picker.addEventListener('value-changed', (e) => {
+        // ha-entity-picker fires value-changed
+        const fakeEv = {
+          target: {
+            tagName: 'HA-ENTITY-PICKER',
+            dataset: { field: 'entity', index: idx },
+            value: e.detail?.value ?? picker.value,
+          },
+        };
+        this._handleFieldChange(fakeEv);
+      });
+    });
+
+    // Icon picker
+    this.shadowRoot.querySelectorAll('ha-icon-picker').forEach((picker) => {
+      if (this._hass) picker.hass = this._hass;
+      picker.value = this._config.icon || '';
+      picker.addEventListener('value-changed', (e) => {
+        const fakeEv = {
+          target: {
+            tagName: 'HA-ICON-PICKER',
+            dataset: { field: 'icon' },
+            value: e.detail?.value ?? picker.value,
+          },
+        };
+        this._handleFieldChange(fakeEv);
+      });
+    });
+
+    this.shadowRoot.querySelectorAll('.btn-danger').forEach((btn) => {
+      btn.addEventListener('click', (e) => this._removeEntity(e));
+    });
+
+    const addBtn = this.shadowRoot.querySelector('#add-btn');
+    if (addBtn) {
+      addBtn.addEventListener('click', () => this._addEntity());
+    }
+
+    this._rendered = true;
+  }
+
+  _escape(str) {
+    return String(str)
+      .replace(/&/g, '&amp;')
+      .replace(/"/g, '&quot;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;');
+  }
+}
+
+// Define Web Components
 customElements.define('one-to-four-bar-chart', OneToFourBarChartCard);
 customElements.define('one-to-four-bar-chart-editor', OneToFourBarChartEditor);
-```
-
-Static methods on the card class:
-
-| Method | Purpose |
-|--------|---------|
-| `getConfigElement()` | Returns the editor element for the GUI config flow |
-| `getStubConfig()` | Default config when you add a new card from the picker |
-
----
-
-## Configuration reference
-
-### Top-level options
-
-| Option | Type | Default | Description |
-|--------|------|---------|-------------|
-| `title` | string | — | Card title |
-| `icon` | string | — | MDI icon under the title (e.g. `mdi:battery`) |
-| `entities` | array | **required** | 1–4 series configs (see below) |
-| `orientation` | `vertical` \| `horizontal` | `vertical` | Bar direction |
-| `value_label_position` | `top` \| `bottom` \| `both` \| `none` | `top` | Where value text sits relative to the bar (`top` = outer end, `bottom` = near baseline) |
-| `value_label_trigger` | `always` \| `hover` \| `tap` | `always` | When value labels are visible |
-| `show_trend_all` | boolean | `false` | Master override: when set in the editor, turns **on/off** `show_trend` on **every** entity |
-| `decimals` | number 0–6 | `1` | Decimal places for value, bound, and warning labels (trailing zeros trimmed) |
-| `scale_mode` | `auto` \| `fixed` \| `history_24h` | `auto` | How min/max of the chart are chosen |
-| `min_value` | number \| entity_id \| Jinja \| null | `null` | Scale minimum and/or lower bound source |
-| `max_value` | number \| entity_id \| Jinja \| null | `null` | Scale maximum and/or upper bound source |
-| `show_zero_line` | boolean | `true` | Dashed zero line when scale crosses 0 |
-| `show_upper_bound` | boolean | `false` | Draw upper reference line |
-| `show_lower_bound` | boolean | `false` | Draw lower reference line |
-| `label_upper_bound` | boolean | `false` | Show numeric label on upper bound line |
-| `label_lower_bound` | boolean | `false` | Show numeric label on lower bound line |
-| `upper_bound_color` | string (hex) | `#ffffff` | Colour of the upper bound line **and** its label |
-| `lower_bound_color` | string (hex) | `#ffffff` | Colour of the lower bound line **and** its label |
-| `warn_above` | number \| entity_id \| Jinja \| null | `null` | Warn if value is **above** this threshold |
-| `warn_below` | number \| entity_id \| Jinja \| null | `null` | Warn if value is **below** this threshold |
-| `show_warning_lines` | boolean | `true` | Draw dashed lines at warning thresholds |
-| `label_warning_lines` | boolean | `false` | Show numeric labels on warning lines |
-| `warn_above_color` | string (hex) | `#EAB308` | Colour of the upper warning line **and** its label |
-| `warn_below_color` | string (hex) | `#EAB308` | Colour of the lower warning line **and** its label |
-| `show_y_labels` | boolean | `false` | Region labels (e.g. Export / Import) |
-| `y_label_above` | string | — | Label for positive side of zero |
-| `y_label_below` | string | — | Label for negative side of zero |
-| `y_label_color` | string (hex) | `#9ca3af` | Colour of the Y-axis region labels |
-| `height_scale` | number | `1` | Multiplier for chart height (~0.5–3) |
-| `background_type` | `solid` \| `gradient` \| `image` | `solid` | Card background style |
-| `bg_color` | string | theme / dark grey | Solid background (hex or CSS variable) |
-| `bg_gradient_start` / `bg_gradient_end` | string | — | Gradient colours |
-| `bg_image_url` | string | — | Background image URL |
-| `bg_image_fit` | `cover` \| `contain` \| `fill` \| `center` | `cover` | Image sizing |
-| `bg_opacity` | number | `0.2` | Dark overlay when using an image |
-
-### Per-entity (`entities[]`) options
-
-| Option | Type | Default | Description |
-|--------|------|---------|-------------|
-| `entity` | string | — | Home Assistant entity id |
-| `name` | string | friendly name | Series label on the chart |
-| `name_color` | string | theme secondary | Colour of the series name |
-| `unit` | string | entity unit | Override unit text on labels |
-| `factor` | number | `1` | Multiplier applied to live state **and** 24h history (e.g. `0.001` for W→kW) |
-| `color` | string | palette | Bar colour when value ≥ 0 |
-| `color_negative` | string | — | Bar colour when value &lt; 0 |
-| `color_mode` | `solid` \| `gradient` | `solid` | Fill style |
-| `color_end` | string | — | Gradient end colour (positive) |
-| `color_end_negative` | string | — | Gradient end colour (negative) |
-| `show_trend` | boolean | `false` | Show **▲ / ▼** next to this bar’s value label (vs previous entity state) |
-
----
-
-## Trend triangles
-
-Optional direction indicator beside each value label.
-
-| Behaviour | Detail |
-|-----------|--------|
-| **Glyph** | `▲` when the value rose vs the previous state; `▼` when it fell |
-| **Placement** | Appended to the value label text (same position / trigger as the number: outer, baseline, both, or none) |
-| **Colour** | Same as the value label (inherits `.val-label` colour) |
-| **Source** | Compares current numeric state to the **last different** numeric state for that entity (tracked in the card instance) |
-| **Hide window** | Glyph is **hidden** if there has been no change for **5 minutes**; a timer re-renders so it disappears without waiting for another state update |
-| **First sample** | No glyph until at least one real change has been observed after the card loaded |
-| **Equal values** | No glyph when current equals previous |
-
-### Editor controls
-
-- **Per bar:** checkbox *“Show trend ▲/▼ (vs previous value)”* inside each entity box  
-- **Master:** *“Show trend on all bars”* under Label & Scale Options — sets every entity’s `show_trend` to on or off together  
-- Changing individual bars keeps the master checkbox in sync (checked only when **all** bars have trend enabled)
-
-### YAML example
-
-```yaml
-type: custom:one-to-four-bar-chart
-title: Batteries
-entities:
-  - entity: sensor.pw_batt_1_soc
-    name: Batt 1
-    unit: "%"
-    color: "#3B82F6"
-    show_trend: true
-  - entity: sensor.pw_batt_2_soc
-    name: Batt 2
-    unit: "%"
-    color: "#10B981"
-    show_trend: true
-```
-
----
-
-## Scale modes
-
-### Auto (`auto`)
-Min/max derived from **current** bar values (with light padding). All-positive data typically floors at 0. Warning thresholds (if set) are included so their lines stay on the plot.
-
-### Fixed (`fixed`)
-Scale uses resolved **Min** and **Max**. Those values are also used for bound lines when those options are enabled.
-
-### 24h history (`history_24h`)
-Fetches 24 hours of history via the WebSocket API (`history/history_during_period`), applies each series’ **factor**, and sets scale from the combined history + current values. Warning thresholds are included in the range when set. Useful so a short bar still sits in a meaningful daily context.
-
-**Fetch behaviour:** The history query runs **once** when the card is first created or its configuration changes (entities / scale mode). It is **not** repeated on every entity state update. The resulting min/max are held for the life of that card instance (until a browser refresh or the card is destroyed and re-created). On systems with a large recorder database this single query can cause a brief CPU spike while the history is retrieved; after that the card behaves like any other live-value card.
-
----
-
-## Min / Max / warnings: numbers, entities, and templates
-
-`min_value`, `max_value`, `warn_above`, and `warn_below` all accept:
-
-| Kind | Example |
-|------|---------|
-| Static number | `100` |
-| Entity id | `sensor.battery_capacity` |
-| Jinja template | `{{ states('sensor.a') \| float(0) * 1.1 }}` |
-
-**Resolution order**
-
-1. Looks like Jinja (`{{` or `{%`) → HA `render_template` subscription (live updates)  
-2. Looks like `domain.object_id` → entity state  
-3. Otherwise → parsed as a number  
-
-**How Min/Max interact with scale and bound lines**
-
-| Mode | Role of Min/Max |
-|------|------------------|
-| **Fixed** | Define the scale; bound lines sit on those limits when enabled |
-| **Auto / 24h** | Optional overrides: if set and bound lines are on, scale **expands** so the bound is always on the plot; if Min/Max empty but “show bound line” is on, the line marks the **computed** scale edge (e.g. 24h peak) |
-
-Leave Min/Max empty in auto/24h when you only want data-driven scaling with no override.
-
----
-
-## Reference lines
-
-- **Zero line** — only when min &lt; 0 &lt; max and `show_zero_line` is true  
-- **Upper / lower bounds** — dashed lines; optional value labels (respecting **Decimals** and the first series’ unit when set). Colour controlled by `upper_bound_color` / `lower_bound_color` (applies to both the line and its label).  
-- **Warning lines** — dashed lines at `warn_above` / `warn_below` when configured and `show_warning_lines` is true. Colour controlled independently by `warn_above_color` / `warn_below_color` (applies to both the line and its label).  
-
----
-
-## Warning thresholds
-
-Card-level operational limits (separate from scale bound lines).
-
-| Setting | Meaning |
-|---------|---------|
-| `warn_above` | Values **above** this are out of spec |
-| `warn_below` | Values **below** this are out of spec |
-
-**Bar styling**
-
-- Value inside the safe band → normal solid/gradient fill  
-- Value **above** `warn_above` → solid up to the threshold, **yellow/black hazard stripes** on the excess tip  
-- Value **below** `warn_below` → hazard stripes on the out-of-spec segment, solid for the rest  
-
-Works for **vertical and horizontal** orientation. Only the out-of-spec portion is striped, so you can see how far past the limit the value is.
-
-**Example (AC voltage 170–270, warn outside 208–253)**
-
-```yaml
-scale_mode: fixed
-min_value: 170
-max_value: 270
-warn_below: 208
-warn_above: 253
-show_warning_lines: true
-label_warning_lines: true
-warn_above_color: "#EAB308"
-warn_below_color: "#EF4444"
-```
-
-| Value | Appearance |
-|-------|------------|
-| 240 | Fully normal colour |
-| 259 | Solid to 253, striped tip 253→259 |
-| 200 | Striped on the portion below 208 |
-
----
-
-## Orientation
-
-- **Vertical** — classic columns; series names under bars; zero/bounds/warnings horizontal  
-- **Horizontal** — bars grow left/right; series names on the left; zero/bounds/warnings vertical  
-
-Y-region labels (`y_label_above` / `y_label_below`) adapt: rotated on the left in vertical mode; upright above the value axis in horizontal mode. Colour is controlled by `y_label_color`.
-
----
-
-## Interaction
-
-- **Click** a bar or its series label → `hass-more-info` for that entity  
-- **Keyboard** — focus the bar group (Tab) and press Enter or Space  
-
-Clicks use a full column/row hit target so more-info works reliably on the bar and the label. The card only fully re-renders when watched entity states change, which avoids flicker and broken clicks on live sensors.
-
----
-
-## Card behaviour (runtime)
-
-### Lifecycle
-
-| Step | What happens |
-|------|----------------|
-| `setConfig(config)` | Merges defaults, validates `entities`, sets up min/max/warn resolvers, optional history fetch, renders |
-| `set hass(hass)` | Updates trend state; updates entity data; skips full re-render if watched states are unchanged (reduces flicker); refreshes entity-based bounds/warnings |
-| `disconnectedCallback` | Unsubscribes Jinja template listeners; clears trend hide timer |
-
-### Rendering pipeline (simplified)
-
-1. Read up to 4 entities → apply **factor** → build bar values  
-2. Resolve scale via `getMinMaxValues` (auto / fixed / history + bound & warning range)  
-3. Split each bar into solid + optional warning-stripe segments  
-4. Build SVG: bars, labels (with optional trend glyphs), zero/bound/warning lines (with configured colours), patterns, optional gradients  
-5. Apply background, title, icon  
-6. Schedule trend hide timer if any active trend is within the 5-minute window  
-
-### Performance notes
-
-- Full SVG rebuild only when a **watched entity state** changes (series entities + entity-type min/max/warnings)  
-- Template fields update via subscription and trigger their own render  
-- Hover styles avoid CSS `filter` on bars (that caused unreliable clicks / flicker in SVG)  
-- Trend hide uses a single timeout so glyphs clear after 5 minutes without continuous polling  
-- **24h history scale:** history is fetched **once** per card instance (on first load or config change), not on every state change. A large recorder database may produce a short CPU spike during that single fetch; afterwards there is no ongoing history load from this card.  
-
----
-
-## GUI editor
-
-Opened from the standard Lovelace **Configure card** UI (`getConfigElement()`).
-
-### Editor capabilities
-
-- **Card title** (text)  
-- **Card icon** (`ha-icon-picker` when available, else text)  
-- **Entities** (up to 4):
-  - `ha-entity-picker` when HA components load successfully  
-  - Label, label colour, unit, factor  
-  - **Show trend** checkbox per series  
-  - Fill mode (solid/gradient), bar + / − colours, gradient ends  
-  - Add / remove series  
-- **Orientation**, value label position & trigger  
-- **Show trend on all bars** master checkbox (bulk-sets each series’ `show_trend`)  
-- **Scale mode**, Min/Max (text — number / entity / template)  
-- Zero line, reference line toggles + labels + **colour pickers** for upper/lower bounds  
-- **Warning thresholds** (warn if below / above, show lines, label lines) + **separate colour pickers** for above/below warning lines  
-- Y-axis region labels + **colour picker**  
-- Height scale & decimals  
-- Background type and related colour / image fields  
-
-### Editor UX details
-
-- Uses **`change`** events (not `input`) so typing in text fields does not steal focus  
-- Structural changes (scale mode, background type, entity count, etc.) re-render the form; value-only changes **sync in place** where possible  
-- Loads `ha-entity-picker` / `ha-icon-picker` by invoking known HA card config elements when needed  
-- Colour pickers for bounds, warnings, and Y labels sit next to their related checkboxes so the form stays organised  
-- Master trend toggle writes `show_trend` on every entity; individual trend toggles update `show_trend_all` so the master stays consistent  
-
----
-
-## YAML examples
-
-### SOC with 100% ceiling and trends
-
-```yaml
-type: custom:one-to-four-bar-chart
-title: Powerwall Batteries SOC
-icon: mdi:home-battery
-orientation: vertical
-scale_mode: auto
-max_value: 100
-show_upper_bound: true
-label_upper_bound: true
-upper_bound_color: "#94a3b8"
-decimals: 1
-entities:
-  - entity: sensor.pw_batt_1_soc
-    name: Batt 1
-    color: "#3B82F6"
-    unit: "%"
-    show_trend: true
-  - entity: sensor.pw_batt_2_soc
-    name: Batt 2
-    color: "#10B981"
-    unit: "%"
-    show_trend: true
-```
-
-### Power in kW with factor and ± colours
-
-```yaml
-type: custom:one-to-four-bar-chart
-title: Grid
-orientation: horizontal
-scale_mode: history_24h
-show_zero_line: true
-show_y_labels: true
-y_label_above: Export
-y_label_below: Import
-y_label_color: "#e2e8f0"
-entities:
-  - entity: sensor.grid_power_w
-    name: Grid
-    factor: 0.001
-    unit: kW
-    color: "#3B82F6"
-    color_negative: "#EF4444"
-    show_trend: true
-```
-
-### AC voltage with warning band and custom colours
-
-```yaml
-type: custom:one-to-four-bar-chart
-title: AC Voltage
-orientation: horizontal
-scale_mode: fixed
-min_value: 170
-max_value: 270
-warn_below: 208
-warn_above: 253
-show_warning_lines: true
-label_warning_lines: true
-warn_above_color: "#EAB308"
-warn_below_color: "#EF4444"
-upper_bound_color: "#64748b"
-lower_bound_color: "#64748b"
-decimals: 0
-entities:
-  - entity: sensor.phase_a_voltage
-    name: Phase A
-    unit: V
-    color: "#3B82F6"
-    show_trend: true
-  - entity: sensor.phase_b_voltage
-    name: Phase B
-    unit: V
-    color: "#3B82F6"
-    show_trend: true
-  - entity: sensor.phase_c_voltage
-    name: Phase C
-    unit: V
-    color: "#3B82F6"
-    show_trend: true
-```
-
-### Dynamic max from template
-
-```yaml
-type: custom:one-to-four-bar-chart
-title: Load vs capacity
-scale_mode: fixed
-min_value: 0
-max_value: "{{ states('sensor.inverter_max_w') | float(0) * 0.001 }}"
-show_upper_bound: true
-label_upper_bound: true
-upper_bound_color: "#f59e0b"
-entities:
-  - entity: sensor.house_load_w
-    name: House
-    factor: 0.001
-    unit: kW
-    color: "#F59E0B"
-```
-
-### Background image
-
-```yaml
-type: custom:one-to-four-bar-chart
-title: House / Shed Solar
-background_type: image
-bg_image_url: /local/images/solar_bg.png
-bg_image_fit: cover
-bg_opacity: 0.35
-orientation: horizontal
-entities:
-  - entity: sensor.house_solar_kw
-    name: House
-    color: "#F59E0B"
-  - entity: sensor.shed_solar_kw
-    name: Shed
-    color: "#EF4444"
-```
-
----
-
-## Troubleshooting
-
-| Symptom | Things to check |
-|---------|------------------|
-| Card missing from picker | Resource URL, `type: module`, hard refresh |
-| Entity picker missing in editor | HA version / frontend load; fallback text field still works |
-| Colour pickers missing in editor | Hard-refresh the browser; ensure you have the latest `1_to_4_bar_chart.js` |
-| Trend checkbox / master missing | Hard-refresh; confirm resource is the version that includes `show_trend` |
-| Trend triangle never appears | Enable `show_trend` on the series; wait for the entity state to **change** at least once after the card loaded |
-| Trend stays forever | Should clear after 5 minutes of no change; if not, hard-refresh and confirm the latest file (includes `_scheduleTrendHide`) |
-| 24h scale looks wrong | Recorder enabled for those entities; **factor** applied to history and live values |
-| Bound line missing | Enable show upper/lower; ensure resolved min/max is valid; fixed mode needs Min/Max set |
-| Warning stripes not showing | Value must be outside `warn_above` / `warn_below`; thresholds must resolve to numbers |
-| Warning lines missing | Set thresholds; ensure `show_warning_lines` is true; value must fall within current scale (fixed min/max or auto expansion) |
-| Bound / warning / Y label colours not applied | Confirm the colour options are set (hex values); hard-refresh after updating the resource |
-| Template min/max/warn not updating | Valid Jinja; entity available; check browser console for subscribe errors |
-| more-info unreliable | Use latest file (hit target + render gating); click bar or series label |
-| Flickering bars | Ensure you have the version that only re-renders on relevant state changes |
-
----
-
-## File map (code structure)
-
-| Class / area | Role |
-|--------------|------|
-| `OneToFourBarChartCard` | Card element: config, hass, history, scale, SVG render, more-info |
-| `OneToFourBarChartEditor` | Shadow-DOM form editor, config-changed events |
-| Bound resolvers | Number / entity / Jinja for `min_value`, `max_value`, `warn_above`, `warn_below` |
-| `getMinMaxValues` | Scale + bound line positions |
-| `_barSegments` | Split bar into solid + warning-stripe segments |
-| `formatNumber` | Shared decimal formatting |
-| `_barFill` / `_gradientDef` | Solid vs gradient fills, ± colours |
-| Colour options | `upper_bound_color`, `lower_bound_color`, `warn_above_color`, `warn_below_color`, `y_label_color` applied to lines and labels |
-| Trend | `_trendState`, `_updateTrendState`, `_getTrendGlyph`, `_scheduleTrendHide`; per-entity `show_trend` + editor master `show_trend_all` |
-
----
-
-## Requirements
-
-- Home Assistant with Lovelace  
-- For **24h history scale**: Recorder (or equivalent history) for the selected entities  
-- For **Jinja** min/max/warnings: standard HA template engine (frontend WebSocket)  
-- Modern browser with ES module support  
-
----
-
-## Disclaimer / License
-
-**This card is provided as-is, with no warranty of any kind, express or implied.** That includes, without limitation, any implied warranties of merchantability, fitness for a particular purpose, or non-infringement. Use at your own risk.
-
-- Results can vary between Home Assistant versions, browsers, hardware, and database sizes.  
-- Always **back up** your configuration and recorder database before installing or updating custom resources.  
-- The author accepts **no liability** for data loss, performance problems, broken dashboards, or any other damage arising from installing, configuring, or using this card.  
-- If something goes wrong, restore from your backup; do not assume the card or its documentation will protect you from misconfiguration or system issues.
-
-You may use, copy, and modify this single-file module in your own Home Assistant setup or share it as you prefer. No external npm package is required.
